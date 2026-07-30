@@ -8,6 +8,7 @@ def canonical_args(extra=""):
     return main.parser().parse_args(("--method lfhe --num-clients 30 --seed 42 --protocol canonical --output-dir unused "+extra).split())
 def test_canonical_defaults():
     c=main.make_config(canonical_args()); assert (c.alpha,c.rounds,c.local_epochs,c.batch_size,c.lr,c.topology_interval,c.eval_interval,c.dmax,c.w1,c.w2,c.w3)==(.1,300,1,32,.05,5,5,4,1.,1.,.1)
+    model=main.CNN(); assert list(model.classifier[-1].weight.shape)==[10,256] and model.get_representation().numel()==2560
 def test_paired_initial_graph_and_models():
     a=main.make_config(canonical_args()); b=main.make_config(main.parser().parse_args("--method static_random --num-clients 30 --seed 42 --protocol canonical --output-dir unused".split()))
     assert set(main.initial_graph(a).edges())==set(main.initial_graph(b).edges())
@@ -35,3 +36,18 @@ def test_checkpoint_resume_reproduces_toy_execution():
     main.aggregate(states,graph,range(6)); expected=[main.clone_state(s) for s in states]
     resumed=[main.clone_state(s) for s in saved_states]; main.restore_rng(saved_rng); main.aggregate(resumed,graph,range(6))
     assert all(torch.equal(expected[i][k],resumed[i][k]) for i in range(6) for k in expected[i])
+def test_hard_and_disconnected_topologies():
+    hard=main.clustered_hard(100,4,42,True); disconnected=main.clustered_hard(100,4,42,False)
+    assert main.nx.is_connected(hard) and max(dict(hard.degree()).values())<=4
+    assert main.nx.number_connected_components(disconnected)==2
+def test_fixed_samples_partition_and_repair_metrics():
+    labels=np.repeat(np.arange(10),100); splits,meta=main.dirichlet_split(labels,20,.1,5,42,return_stats=True,samples_per_client=20)
+    assert set(map(len,splits))=={20} and 0<=meta["repaired_sample_fraction"]<=1
+def test_link_failure_view_is_deterministic():
+    graph=main.bounded_connected(30,4,42); a,na=main.failed_link_view(graph,.3,7); b,nb=main.failed_link_view(graph,.3,7)
+    assert set(a.edges())==set(b.edges()) and na==nb
+def test_snapshot_concurrent_preserves_degree_cap():
+    cfg=main.make_config(main.parser().parse_args("--method lfhe --num-clients 20 --seed 42 --protocol scalable --output-dir unused --update-mode snapshot_concurrent".split()))
+    states=main.initial_states(20,42); graph=main.bounded_connected(20,4,42); clients=[main.Adapter(s) for s in states]
+    updated,trace,stats=main.snapshot_concurrent_lfhe(graph,clients,range(20),cfg,0)
+    assert max(dict(updated.degree()).values())<=4 and 0<=stats["shared_endpoint_conflict_rate"]<=1

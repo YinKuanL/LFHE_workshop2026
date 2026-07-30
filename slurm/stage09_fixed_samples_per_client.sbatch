@@ -6,8 +6,8 @@
 #SBATCH --time=12:00:00
 #SBATCH --signal=B:USR1@180
 #SBATCH --requeue
-#SBATCH --array=1-90%4
+#SBATCH --array=1-27%4
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
-export MANIFEST=manifests/fixed_degree_scaling_pilot.csv
+export MANIFEST=manifests/stage09_fixed_samples_per_client.csv
 source slurm/manifest_worker.sh

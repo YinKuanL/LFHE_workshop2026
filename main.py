@@ -46,6 +46,8 @@ class Config:
     checkpoint_interval:int; checkpoint_path:str; resume:bool; force:bool; eval_clients:int
     final_eval_all:bool; data_root:str; update_mode:str; min_samples_per_client:int
     target_accuracy:float; graph_metric_interval:int; dissdl_max_n:int; num_workers:int
+    samples_per_client:int|None; link_failure_rate:float; stale_view_rounds:int
+    repair_warning_fraction:float
     w1:float=1.; w2:float=1.; w3:float=.1; epsilon:float=.05
     dataset:str="cifar10"; data_regime:str="fixed_total"; optimizer:str="SGD"
 
@@ -67,22 +69,35 @@ def load_cifar(root):
     return (datasets.CIFAR10(root,train=True,download=True,transform=train_tf),
             datasets.CIFAR10(root,train=False,download=True,transform=test_tf))
 
-def dirichlet_split(labels, n, alpha, minimum, seed, preserve_original=False, max_attempts=1000):
+def dirichlet_split(labels, n, alpha, minimum, seed, preserve_original=False, max_attempts=1000,
+                    return_stats=False, samples_per_client=None):
     """Original classwise split, deterministically resampled until the minimum holds."""
     if minimum*n > len(labels): raise ValueError("min-samples-per-client exceeds fixed dataset size")
-    for attempt in range(max_attempts):
+    attempts=max_attempts if preserve_original else 1
+    for attempt in range(attempts):
         rng=np.random.RandomState(seed+attempt); result=[[] for _ in range(n)]
         for c in range(int(labels.max())+1):
             idx=np.where(labels==c)[0]; rng.shuffle(idx)
             cuts=(np.cumsum(rng.dirichlet(np.repeat(alpha,n)))*len(idx)).astype(int)[:-1]
             for i,part in enumerate(np.split(idx,cuts)): result[i].extend(part.tolist())
-        if min(map(len,result)) >= minimum: return result
-        if preserve_original and minimum == 0: return result
+        if min(map(len,result)) >= minimum: break
+        if preserve_original and minimum == 0: break
     # Stable repair is the scalable fallback when rejection sampling is improbable.
+    repaired=0
     while min(map(len,result)) < minimum:
         receiver=min(range(n),key=lambda i:(len(result[i]),i)); donor=max(range(n),key=lambda i:(len(result[i]),-i))
-        result[receiver].append(result[donor].pop())
-    return result
+        result[receiver].append(result[donor].pop()); repaired+=1
+    if samples_per_client is not None:
+        if samples_per_client*n > len(labels): raise ValueError("samples-per-client exceeds CIFAR-10 capacity")
+        if min(map(len,result)) < samples_per_client:
+            while min(map(len,result)) < samples_per_client:
+                receiver=min(range(n),key=lambda i:(len(result[i]),i)); donor=max(range(n),key=lambda i:(len(result[i]),-i))
+                if len(result[donor])<=samples_per_client: raise RuntimeError("cannot construct fixed-samples-per-client split")
+                result[receiver].append(result[donor].pop()); repaired+=1
+        result=[indices[:samples_per_client] for indices in result]
+    meta={"partition_resampling_attempts":attempt+1,"repaired_samples":repaired,
+          "repaired_sample_fraction":repaired/max(1,sum(map(len,result)))}
+    return (result,meta) if return_stats else result
 
 def partition_stats(labels,splits):
     ent=[]
@@ -110,9 +125,33 @@ def bounded_connected(n,dmax,seed):
     assert nx.is_connected(g) and max(dict(g.degree()).values())<=dmax
     return g
 
+def clustered_hard(n,dmax,seed,connected=True):
+    """Two dense-ish ring communities; one bridge when connected."""
+    if n<6 or dmax<2: raise ValueError("clustered topology requires N>=6 and D_max>=2")
+    cut=n//2; g=nx.disjoint_union(nx.cycle_graph(cut),nx.cycle_graph(n-cut))
+    if connected:
+        g.remove_edge(0,cut-1); g.remove_edge(cut,n-1); g.add_edge(0,cut); g.add_edge(cut-1,n-1)
+    if dmax>2:
+        rng=random.Random(seed); groups=[list(range(cut)),list(range(cut,n))]
+        for group in groups:
+            pairs=[(u,v) for u in group for v in group if u<v]; rng.shuffle(pairs)
+            for u,v in pairs:
+                if g.degree(u)<dmax and g.degree(v)<dmax and not g.has_edge(u,v): g.add_edge(u,v)
+    return g
+
 def initial_graph(cfg):
     if cfg.method=="ring": return nx.cycle_graph(cfg.num_clients)
-    return canonical_er(cfg.num_clients,cfg.seed) if cfg.initial_graph=="canonical_er" else bounded_connected(cfg.num_clients,cfg.dmax,cfg.seed)
+    if cfg.method=="epidemic" and cfg.protocol=="canonical": return build_epidemic_graph(cfg.num_clients,cfg.dmax,cfg.seed)
+    if cfg.method=="dissdl" and cfg.protocol=="canonical":
+        rng=random.Random(cfg.seed); graph=nx.DiGraph(); graph.add_nodes_from(range(cfg.num_clients))
+        for i in range(cfg.num_clients):
+            peers=[j for j in range(cfg.num_clients) if j!=i]
+            graph.add_edges_from((j,i) for j in rng.sample(peers,min(3,len(peers))))
+        return graph
+    if cfg.initial_graph=="canonical_er": return canonical_er(cfg.num_clients,cfg.seed)
+    if cfg.initial_graph=="clustered": return clustered_hard(cfg.num_clients,cfg.dmax,cfg.seed,True)
+    if cfg.initial_graph=="disconnected_clusters": return clustered_hard(cfg.num_clients,cfg.dmax,cfg.seed,False)
+    return bounded_connected(cfg.num_clients,cfg.dmax,cfg.seed)
 
 def graph_stats(g, expensive=True):
     und=g.to_undirected(); deg=[d for _,d in und.degree()]; comps=nx.number_connected_components(und)
@@ -151,6 +190,14 @@ def aggregate(states,g,active):
     for i,s in updates.items(): states[i]=s
     return transmissions
 
+def failed_link_view(graph, rate, seed):
+    if rate<=0: return graph,0
+    rng=random.Random(seed); view=graph.copy(); removed=[]
+    for edge in list(view.edges()):
+        if rng.random()<rate: removed.append(edge)
+    view.remove_edges_from(removed)
+    return view,len(removed)
+
 def fedavg(states,active):
     avg=weighted_average([(1/len(active),states[i]) for i in active])
     for i in active: states[i]=clone_state(avg)
@@ -165,7 +212,7 @@ def epidemic_aggregate(states,g,active):
     return tx
 
 class _RepresentationModel:
-    def __init__(self,state): self.weight=state["classifier.4.weight"]
+    def __init__(self,state): self.weight=state["classifier.4.weight"] if isinstance(state,dict) else state
     def get_representation(self): return self.weight.flatten()
 class Adapter:
     """Lightweight canonical LFHE interface; does not allocate another CNN."""
@@ -174,11 +221,11 @@ class Adapter:
 def fof_update(g, active, dmax, random_policy=False):
     g=g.copy(); trace=[]
     for i in active:
-        event={"candidate_checks":0,"fitness_evaluations":0,"action":"no_candidate"}; ni=list(g.neighbors(i))
+        event={"client":int(i),"candidate_checks":0,"fitness_evaluations":0,"action":"no_candidate"}; ni=list(g.neighbors(i))
         if ni:
             j=random.choice(ni); candidates=[k for k in g.neighbors(j) if k!=i and not g.has_edge(i,k)]
             if candidates:
-                k=random.choice(candidates); event["candidate_checks"]=1; event["action"]="rejected_proposal"
+                k=random.choice(candidates); event["candidate"]=int(k); event["candidate_checks"]=1; event["action"]="rejected_proposal"
                 if g.degree(i)<dmax and g.degree(k)<dmax:
                     # Random baseline ranks/accepts independently of model fitness.
                     if random.random()<.5: g.add_edge(i,k); event["action"]="accepted_addition"
@@ -192,14 +239,49 @@ def fof_update(g, active, dmax, random_policy=False):
         trace.append(event)
     return g,trace
 
+def snapshot_concurrent_lfhe(graph, clients, active, cfg, round_index):
+    """Propose on one immutable snapshot, then commit conflict-free proposals.
+
+    Proposal generation calls canonical single-client LFHE semantics. Commit order is
+    deterministic by client id and rejects shared endpoints or stale infeasibility.
+    """
+    snapshot=graph.copy(); proposals=[]; trace=[]
+    def edges(g): return {tuple(sorted((int(u),int(v)))) for u,v in g.edges()}
+    for i in sorted(active):
+        local_trace=[]
+        proposed=lfhe_update(snapshot,clients,cfg.epsilon,cfg.dmax,cfg.w1,cfg.w2,cfg.w3,
+                             round_index,local_trace,[i])
+        event=local_trace[0] if local_trace else {"client":i,"action":"no_candidate","candidate_checks":0,"fitness_evaluations":0}
+        added=edges(proposed)-edges(snapshot); removed=edges(snapshot)-edges(proposed)
+        if added or removed: proposals.append((i,added,removed,event))
+        trace.append(event)
+    committed=snapshot.copy(); touched=set(); conflicts=stale_rejections=degree_rejections=0
+    for i,added,removed,event in proposals:
+        endpoints={x for edge in added|removed for x in edge}
+        if endpoints&touched:
+            conflicts+=1; event["action"]="rejected_shared_endpoint_conflict"; continue
+        candidate=committed.copy()
+        if any(not candidate.has_edge(*edge) for edge in removed):
+            stale_rejections+=1; event["action"]="rejected_stale_topology"; continue
+        candidate.remove_edges_from(removed); candidate.add_edges_from(added)
+        if max(dict(candidate.degree()).values())>cfg.dmax:
+            degree_rejections+=1; event["action"]="rejected_degree_safety"; continue
+        committed=candidate; touched.update(endpoints); event["action"]="committed_"+event["action"]
+    stats={"proposal_count":len(proposals),"shared_endpoint_conflicts":conflicts,
+           "shared_endpoint_conflict_rate":conflicts/max(1,len(proposals)),
+           "stale_rejections":stale_rejections,"degree_safety_rejections":degree_rejections,
+           "committed_proposals":len(proposals)-conflicts-stale_rejections-degree_rejections}
+    return committed,trace,stats
+
 def dissdl_aggregate(states, nodes, active):
     active=set(active); updates={}; transmissions=0
     for i in active:
         incoming=[j for j in nodes[i].wanted_senders if j in active]; transmissions+=len(incoming)
         updates[i]=weighted_average([(1/(len(incoming)+1),states[j]) for j in incoming]+[(1/(len(incoming)+1),states[i])])
-        rep_i=states[i]["classifier.4.weight"].flatten().float()
+        def parameters(state): return torch.cat([value.flatten().float() for key,value in state.items() if not any(token in key for token in ("running_mean","running_var","num_batches_tracked"))])
+        rep_i=parameters(states[i])
         for j in incoming:
-            rep_j=states[j]["classifier.4.weight"].flatten().float(); sim=float(torch.nn.functional.cosine_similarity(rep_i,rep_j,dim=0))
+            rep_j=parameters(states[j]); sim=float(torch.nn.functional.cosine_similarity(rep_i,rep_j,dim=0))
             nodes[i].similarity_history.setdefault(j,[]).append(sim); nodes[i].similarity_history[j]=nodes[i].similarity_history[j][-5:]
     for i,s in updates.items(): states[i]=s
     return transmissions
@@ -266,17 +348,32 @@ def config_hash(cfg):
     d=asdict(cfg); [d.pop(k,None) for k in ("resume","force","checkpoint_path")]
     return hashlib.sha256(json.dumps(d,sort_keys=True).encode()).hexdigest()[:16]
 
-def summarize(cfg, records, started, pstats, initial, final, deployment):
+def summarize(cfg, records, started, pstats, initial, final, deployment, checkpoint_path=None):
     evals=[r for r in records if "mean_accuracy" in r]; xs=[r["round"] for r in evals]; ys=[r["mean_accuracy"] for r in evals]
-    auc=float(np.trapz(ys,xs)/(xs[-1]-xs[0])) if len(xs)>1 else (ys[0] if ys else None)
+    integrate=getattr(np,"trapezoid",getattr(np,"trapz",None))
+    auc=float(integrate(ys,xs)/(xs[-1]-xs[0])) if len(xs)>1 else (ys[0] if ys else None)
     reached=next((r for r in evals if r["mean_accuracy"]>=cfg.target_accuracy),None)
     accepted=[r["round"] for r in records if r.get("accepted_additions",0)+r.get("accepted_swaps",0)>0]
+    projection_records=records[:-1] if len(records)>1 else records
+    mean_round=float(np.mean([r["total_round_seconds"] for r in projection_records])) if projection_records else None
+    peak_rss=max((r.get("peak_cpu_rss_bytes") or 0 for r in records),default=0); peak_gpu=max((r.get("peak_gpu_reserved_bytes") or 0 for r in records),default=0)
+    checkpoint_bytes=checkpoint_path.stat().st_size if checkpoint_path and checkpoint_path.exists() else None
+    checkpoint_seconds=max((r.get("checkpoint_seconds",0) for r in records),default=0); final_eval=evals[-1].get("evaluation_seconds") if evals else None
+    projected=mean_round*300 if mean_round is not None else None
+    gpu_total=torch.cuda.get_device_properties(0).total_memory if torch.cuda.is_available() else None
+    gate_checks={"projected_300_round_seconds_le_48h":projected is not None and projected<=48*3600,
+      "peak_cpu_rss_le_22_4_gib":peak_rss<=22.4*1024**3,"peak_gpu_reserved_le_90_percent":gpu_total is None or peak_gpu<=.9*gpu_total,
+      "checkpoint_le_10_gib":checkpoint_bytes is not None and checkpoint_bytes<=10*1024**3,"checkpoint_time_le_600s":checkpoint_seconds<=600,
+      "full_evaluation_time_le_3h":final_eval is not None and final_eval<=3*3600,"repair_fraction_le_threshold":pstats.get("repaired_sample_fraction",0)<=cfg.repair_warning_fraction,
+      "no_nan_or_inf":all(r.get("model_parameters_finite",True) and all(not isinstance(v,float) or math.isfinite(v) for v in r.values()) for r in records)}
     return {"experiment_id":config_hash(cfg),"status":"complete","protocol":cfg.protocol,"deployment_protocol":deployment,
       "final_accuracy":ys[-1] if ys else None,"normalized_auc":auc,"rounds_to_target":reached["round"] if reached else None,
       "bytes_to_target":reached["cumulative_bytes"] if reached else None,"wall_clock_time_to_target":reached["elapsed_seconds"] if reached else None,
       "partition":pstats,"initial_graph":initial,"final_graph":final,"wall_clock_seconds":time.time()-started,
       "evaluations":len(evals),"rounds_completed":cfg.rounds,"last_accepted_rewire_round":accepted[-1] if accepted else None,
       "topology_stabilization_round":(accepted[-1]+1) if accepted else 0,
+      "resource_projection":{"mean_round_seconds":mean_round,"projected_300_round_seconds":projected,"peak_cpu_rss_bytes":peak_rss,"peak_gpu_reserved_bytes":peak_gpu,"checkpoint_bytes":checkpoint_bytes,"max_checkpoint_seconds":checkpoint_seconds,"final_full_evaluation_seconds":final_eval},
+      "feasibility_gate":{"passed":all(gate_checks.values()),"checks":gate_checks},
       "scientific_notes":["canonical LFHE fitness/annealing/representation" if cfg.method=="lfhe" else "matched baseline budget"]}
 
 def run(cfg):
@@ -295,23 +392,35 @@ def run(cfg):
         if saved["experiment_id"]!=config_hash(cfg): raise ValueError("checkpoint configuration hash mismatch")
         start=saved["next_round"]; states=saved["client_states"]; splits=saved["data_split"]; graph=nx.node_link_graph(saved["graph"])
         records=saved["metrics"]; diss=[DissDLState.restore(x) for x in saved.get("baseline_state",[])]; restore_rng(saved["rng"])
+        rep_history=saved.get("lfhe_state",{}).get("representation_history",[])
         pstats=saved["partition_stats"]; initial=saved["initial_graph_stats"]
     else:
-        splits=dirichlet_split(labels,cfg.num_clients,cfg.alpha,cfg.min_samples_per_client,cfg.seed,cfg.protocol=="canonical")
-        pstats=partition_stats(labels,splits); states=initial_states(cfg.num_clients,cfg.seed); graph=initial_graph(cfg); start=0; records=[]
-        initial=graph_stats(graph); initial["over_cap_nodes"]=sum(d>cfg.dmax for _,d in graph.degree())
+        samples=cfg.samples_per_client if cfg.data_regime=="fixed_per_client" else None
+        splits,split_meta=dirichlet_split(labels,cfg.num_clients,cfg.alpha,cfg.min_samples_per_client,cfg.seed,cfg.protocol=="canonical",return_stats=True,samples_per_client=samples)
+        pstats={**partition_stats(labels,splits),**split_meta}; pstats["repair_warning"]=pstats["repaired_sample_fraction"]>cfg.repair_warning_fraction
+        states=initial_states(cfg.num_clients,cfg.seed); graph=initial_graph(cfg); start=0; records=[]; rep_history=[]
         diss=[]
         if cfg.method=="dissdl":
             for i in range(cfg.num_clients):
-                peers=set(range(cfg.num_clients))-{i}; diss.append(DissDLState(set(graph.neighbors(i)),peers))
-            directed=nx.DiGraph(); directed.add_nodes_from(range(cfg.num_clients))
-            for i,node in enumerate(diss): directed.add_edges_from((j,i) for j in node.wanted_senders)
-            graph=directed
-        write_edges(out/"graph_initial.edgelist",graph); atomic_json(out/"config.json",{**asdict(cfg),"experiment_id":config_hash(cfg),"deployment_protocol":"partial_participation" if cfg.participation_rate<1 else "full_participation"})
+                peers=set(range(cfg.num_clients))-{i}; initial_senders=set(graph.predecessors(i)) if graph.is_directed() else set(graph.neighbors(i)); diss.append(DissDLState(initial_senders,peers))
+            if not graph.is_directed():
+                directed=nx.DiGraph(); directed.add_nodes_from(range(cfg.num_clients))
+                for i,node in enumerate(diss): directed.add_edges_from((j,i) for j in node.wanted_senders)
+                graph=directed
+        initial=graph_stats(graph); initial["over_cap_nodes"]=sum(d>cfg.dmax for _,d in graph.degree())
+        representation_dimension=int(states[0]["classifier.4.weight"].numel())
+        resolved_initial="dissdl_random_in_degree_3" if cfg.protocol=="canonical" and cfg.method=="dissdl" else "epidemic_directed_degree_4" if cfg.protocol=="canonical" and cfg.method=="epidemic" else cfg.initial_graph
+        write_edges(out/"graph_initial.edgelist",graph); atomic_json(out/"config.json",{**asdict(cfg),"resolved_initial_graph":resolved_initial,"experiment_id":config_hash(cfg),"deployment_protocol":"partial_participation" if cfg.participation_rate<1 else "full_participation","representation_shape":list(states[0]["classifier.4.weight"].shape),"representation_dimension":representation_dimension})
+        print(f"[representation] shape={tuple(states[0]['classifier.4.weight'].shape)} flattened_dimension={representation_dimension}",flush=True)
     fixed_eval=random.Random(cfg.seed+991).sample(range(cfg.num_clients),min(cfg.eval_clients,cfg.num_clients))
     # The reusable execution model must not perturb training/dropout RNG state.
     preserved_rng=rng_state(); working=CNN(); restore_rng(preserved_rng)
     model_bytes=sum(v.numel()*v.element_size() for v in states[0].values()); cumulative=records[-1]["cumulative_bytes"] if records else 0
+    previous_effective_connected=records[-1].get("effective_connected",True) if records else True
+    disconnect_streak=0
+    for previous in reversed(records):
+        if previous.get("effective_connected",True): break
+        disconnect_streak+=1
     for rnd in range(start,cfg.rounds):
         # Method-independent schedule is required for paired comparisons.
         sampler=random.Random(cfg.seed*1_000_003+rnd)
@@ -320,51 +429,68 @@ def run(cfg):
         for i in active: states[i]=train_client(working,states[i],train,splits[i],cfg,device,cfg.seed*1_000_003+rnd*cfg.num_clients+i)
         train_s=time.perf_counter()-t
         if STOP_SIGNAL is not None:
-            payload=checkpoint_payload(cfg,rnd,states,graph,splits,records,diss,pstats,initial); atomic_checkpoint(cp,payload); return EXIT_REQUEUE
+            payload=checkpoint_payload(cfg,rnd,states,graph,splits,records,diss,pstats,initial,rep_history); atomic_checkpoint(cp,payload); return EXIT_REQUEUE
         t=time.perf_counter()
+        aggregation_graph,dropped_links=failed_link_view(graph,cfg.link_failure_rate,cfg.seed*10_000_019+rnd)
         if cfg.method=="fedavg": tx=fedavg(states,active)
-        elif cfg.method=="epidemic": graph=build_epidemic_graph(cfg.num_clients,cfg.dmax,cfg.seed+rnd); tx=epidemic_aggregate(states,graph,active)
+        elif cfg.method=="epidemic": graph=build_epidemic_graph(cfg.num_clients,cfg.dmax,cfg.seed+rnd); aggregation_graph,dropped_links=failed_link_view(graph,cfg.link_failure_rate,cfg.seed*10_000_019+rnd); tx=epidemic_aggregate(states,aggregation_graph,active)
         elif cfg.method=="dissdl": tx=dissdl_aggregate(states,diss,active)
-        else: tx=aggregate(states,graph,active)
-        agg_s=time.perf_counter()-t; topo_s=0.; trace=[]
-        if rnd%cfg.topology_interval==0:
+        else: tx=aggregate(states,aggregation_graph,active)
+        agg_s=time.perf_counter()-t; topo_s=0.; trace=[]; concurrency={"proposal_count":0,"shared_endpoint_conflicts":0,"shared_endpoint_conflict_rate":0.,"stale_rejections":0,"degree_safety_rejections":0,"committed_proposals":0}
+        current_reps=torch.stack([s["classifier.4.weight"].clone() for s in states]); rep_history.append((rnd,current_reps)); rep_history=rep_history[-max(1,cfg.stale_view_rounds+1):]
+        canonical_lfhe_window=(cfg.protocol!="canonical" or cfg.method!="lfhe" or 20<rnd<300)
+        if rnd%cfg.topology_interval==0 and canonical_lfhe_window:
             t=time.perf_counter()
-            if cfg.method=="lfhe": graph=lfhe_update(graph,[Adapter(s) for s in states],cfg.epsilon,cfg.dmax,cfg.w1,cfg.w2,cfg.w3,rnd,trace,None if cfg.update_mode=="sequential" and cfg.participation_rate==1 else active)
+            component_id={node:index for index,component in enumerate(nx.connected_components(graph.to_undirected())) for node in component}
+            view_index=max(0,len(rep_history)-1-cfg.stale_view_rounds); view_round,view_reps=rep_history[view_index]; clients=[Adapter(view_reps[i]) for i in range(cfg.num_clients)]
+            if cfg.method=="lfhe" and cfg.update_mode=="snapshot_concurrent": graph,trace,concurrency=snapshot_concurrent_lfhe(graph,clients,active,cfg,rnd)
+            elif cfg.method=="lfhe": graph=lfhe_update(graph,clients,cfg.epsilon,cfg.dmax,cfg.w1,cfg.w2,cfg.w3,rnd,trace,None if cfg.update_mode=="sequential" and cfg.participation_rate==1 else active)
             elif cfg.method=="random_fof": graph,trace=fof_update(graph,active,cfg.dmax,True)
             elif cfg.method=="dissdl": graph=dissdl_update(diss,states,active)
             topo_s=time.perf_counter()-t
+        else: component_id={node:index for index,component in enumerate(nx.connected_components(graph.to_undirected())) for node in component}
         control=sum(e.get("candidate_checks",0) for e in trace); cumulative += tx*model_bytes + control*16
+        effective_components=nx.number_connected_components(aggregation_graph.to_undirected()); effective_connected=effective_components==1
+        prior_disconnect_streak=disconnect_streak; disconnect_streak=0 if effective_connected else disconnect_streak+1
+        recovery_rounds=prior_disconnect_streak if effective_connected and not previous_effective_connected else None
         rec={"round":rnd,"active_clients":len(active),"model_transmissions":tx,"active_links":graph.number_of_edges(),"model_bytes":tx*model_bytes,
              "topology_control_messages":control,"topology_control_bytes":control*16,"cumulative_bytes":cumulative,"local_training_seconds":train_s,
              "aggregation_seconds":agg_s,"topology_update_seconds":topo_s,"candidate_checks":control,
-             "fitness_evaluations":sum(e.get("fitness_evaluations",0) for e in trace),"accepted_additions":sum(e.get("action")=="accepted_addition" for e in trace),
-             "accepted_swaps":sum(e.get("action")=="accepted_swap" for e in trace),"rejected_proposals":sum(e.get("action","").startswith("rejected") for e in trace)}
+             "link_failure_rate":cfg.link_failure_rate,"failed_links":dropped_links,"effective_connected_components":effective_components,"effective_connected":effective_connected,"recovered_this_round":effective_connected and not previous_effective_connected,"recovery_rounds":recovery_rounds,
+             "stale_view_rounds":cfg.stale_view_rounds,"representation_view_round":view_round if rnd%cfg.topology_interval==0 and canonical_lfhe_window else None,**concurrency,
+             "fitness_evaluations":sum(e.get("fitness_evaluations",0) for e in trace),"accepted_additions":sum(e.get("action","").endswith("accepted_addition") for e in trace),
+             "accepted_swaps":sum(e.get("action","").endswith("accepted_swap") for e in trace),"rejected_proposals":sum(e.get("action","").startswith("rejected") for e in trace),
+             "fof_cross_component_proposals":sum("candidate" in e and component_id.get(e.get("client"))!=component_id.get(e.get("candidate")) for e in trace),"fof_component_count":len(set(component_id.values()))}
         if rnd%cfg.graph_metric_interval==0 or rnd==cfg.rounds-1: rec["graph"]=graph_stats(graph,True)
         if rnd%cfg.eval_interval==0 or rnd==cfg.rounds-1:
             et=time.perf_counter(); ids=list(range(cfg.num_clients)) if (cfg.protocol=="canonical" or (cfg.final_eval_all and rnd==cfg.rounds-1)) else fixed_eval
-            acc,loss=evaluate(working,states,ids,test_loader,device); rec.update({"mean_accuracy":float(np.mean(acc)),"std_accuracy":float(np.std(acc)),"min_accuracy":min(acc),"max_accuracy":max(acc),"mean_loss":float(np.mean(loss)),"evaluated_clients":len(ids),"evaluation_seconds":time.perf_counter()-et}); rec.update(model_metrics(states))
+            acc,loss=evaluate(working,states,ids,test_loader,device); rec.update({"mean_accuracy":float(np.mean(acc)),"std_accuracy":float(np.std(acc)),"min_accuracy":min(acc),"max_accuracy":max(acc),"mean_loss":float(np.mean(loss)),"evaluated_clients":len(ids),"evaluation_seconds":time.perf_counter()-et}); rec.update(model_metrics(states)); rec["model_parameters_finite"]=all(torch.isfinite(v).all().item() for state in states for v in state.values() if v.is_floating_point())
         rec["total_round_seconds"]=time.perf_counter()-rt; rec["elapsed_seconds"]=time.time()-started
         try:
             import psutil; rec["peak_cpu_rss_bytes"]=psutil.Process().memory_info().rss
         except ImportError: rec["peak_cpu_rss_bytes"]=None
         rec["peak_gpu_allocated_bytes"]=torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0; rec["peak_gpu_reserved_bytes"]=torch.cuda.max_memory_reserved() if torch.cuda.is_available() else 0
-        records.append(rec); append_jsonl(out/"metrics.jsonl",rec)
+        records.append(rec)
         if (rnd+1)%cfg.checkpoint_interval==0 or STOP_SIGNAL is not None or rnd==cfg.rounds-1:
-            ct=time.perf_counter(); atomic_checkpoint(cp,checkpoint_payload(cfg,rnd+1,states,graph,splits,records,diss,pstats,initial)); rec["checkpoint_seconds"]=time.perf_counter()-ct
+            ct=time.perf_counter(); atomic_checkpoint(cp,checkpoint_payload(cfg,rnd+1,states,graph,splits,records,diss,pstats,initial,rep_history)); rec["checkpoint_seconds"]=time.perf_counter()-ct
+        append_jsonl(out/"metrics.jsonl",rec)
         if STOP_SIGNAL is not None: return EXIT_REQUEUE
-    final=graph_stats(graph); write_edges(out/"graph_final.edgelist",graph); atomic_json(out/"summary.json",summarize(cfg,records,started,pstats,initial,final,"partial_participation" if cfg.participation_rate<1 else "full_participation")); success.write_text("SUCCESS\n",encoding="utf-8"); return 0
+        previous_effective_connected=effective_connected
+    final=graph_stats(graph); write_edges(out/"graph_final.edgelist",graph); atomic_json(out/"summary.json",summarize(cfg,records,started,pstats,initial,final,"partial_participation" if cfg.participation_rate<1 else "full_participation",cp)); success.write_text("SUCCESS\n",encoding="utf-8"); return 0
 
-def checkpoint_payload(cfg,next_round,states,graph,splits,records,diss,pstats,initial):
+def checkpoint_payload(cfg,next_round,states,graph,splits,records,diss,pstats,initial,rep_history=None):
     return {"format_version":2,"next_round":next_round,"client_states":states,"optimizer_states":None,"graph_type":type(graph).__name__,"graph":nx.node_link_data(graph),
       "data_split":splits,"metrics":records,"rng":rng_state(),"configuration":asdict(cfg),"experiment_id":config_hash(cfg),"active_client_sampler_state":random.getstate(),
-      "lfhe_state":{"update_mode":cfg.update_mode},"baseline_state":[x.checkpoint() for x in diss],"partition_stats":pstats,"initial_graph_stats":initial}
+      "lfhe_state":{"update_mode":cfg.update_mode,"representation_history":rep_history or []},"baseline_state":[x.checkpoint() for x in diss],"partition_stats":pstats,"initial_graph_stats":initial}
 
 def parser():
     p=argparse.ArgumentParser(description=__doc__); p.add_argument("--method",choices=METHODS,required=True); p.add_argument("--num-clients",type=int,required=True); p.add_argument("--seed",type=int,required=True)
     p.add_argument("--rounds",type=int); p.add_argument("--protocol",choices=("canonical","scalable"),required=True); p.add_argument("--alpha",type=float,default=.1); p.add_argument("--dmax",default="4",choices=("2","4","8","log2")); p.add_argument("--topology-interval",type=int); p.add_argument("--eval-interval",type=int)
-    p.add_argument("--initial-graph",choices=("canonical_er","bounded_connected")); p.add_argument("--participation-rate",type=float,default=1.); group=p.add_mutually_exclusive_group(); group.add_argument("--local-epochs",type=int); group.add_argument("--local-steps",type=int)
+    p.add_argument("--initial-graph",choices=("canonical_er","bounded_connected","clustered","disconnected_clusters")); p.add_argument("--participation-rate",type=float,default=1.); group=p.add_mutually_exclusive_group(); group.add_argument("--local-epochs",type=int); group.add_argument("--local-steps",type=int)
     p.add_argument("--batch-size",type=int); p.add_argument("--lr",type=float,default=.05); p.add_argument("--output-dir",required=True); p.add_argument("--checkpoint-interval",type=int,default=10); p.add_argument("--checkpoint-path",default=""); p.add_argument("--resume",action="store_true"); p.add_argument("--force",action="store_true")
-    p.add_argument("--eval-clients",type=int,default=50); p.add_argument("--final-eval-all",action=argparse.BooleanOptionalAction,default=True); p.add_argument("--data-root",default=os.getenv("LFHE_DATA_ROOT","./data")); p.add_argument("--update-mode",choices=("sequential","batched"),default="sequential")
+    p.add_argument("--eval-clients",type=int,default=50); p.add_argument("--final-eval-all",action=argparse.BooleanOptionalAction,default=True); p.add_argument("--data-root",default=os.getenv("LFHE_DATA_ROOT","./data")); p.add_argument("--update-mode",choices=("sequential","snapshot_concurrent"),default="sequential")
+    p.add_argument("--data-regime",choices=("fixed_total","fixed_per_client"),default="fixed_total"); p.add_argument("--samples-per-client",type=int)
+    p.add_argument("--link-failure-rate",type=float,default=0.); p.add_argument("--stale-view-rounds",type=int,default=0); p.add_argument("--repair-warning-fraction",type=float,default=.05)
     p.add_argument("--min-samples-per-client",type=int); p.add_argument("--target-accuracy",type=float,default=.65); p.add_argument("--graph-metric-interval",type=int,default=25); p.add_argument("--dissdl-max-n",type=int,default=500); p.add_argument("--num-workers",type=int,default=0); return p
 
 def make_config(a):
@@ -374,11 +500,15 @@ def make_config(a):
     batch=a.batch_size or 32; minimum=a.min_samples_per_client if a.min_samples_per_client is not None else (1 if canonical else max(1,min(10,50000//a.num_clients//2)))
     dmax=math.ceil(math.log2(a.num_clients)) if a.dmax=="log2" else int(a.dmax)
     if not 0<a.participation_rate<=1: raise ValueError("participation-rate must be in (0,1]")
+    if not 0<=a.link_failure_rate<1: raise ValueError("link-failure-rate must be in [0,1)")
+    if a.stale_view_rounds<0: raise ValueError("stale-view-rounds must be >=0")
+    if a.data_regime=="fixed_per_client" and (a.samples_per_client is None or a.samples_per_client<1): raise ValueError("fixed_per_client requires --samples-per-client")
+    if a.samples_per_client is not None and a.samples_per_client*a.num_clients>50000: raise ValueError("requested fixed-per-client data exceeds CIFAR-10 training set")
     if canonical and a.participation_rate!=1: raise ValueError("canonical protocol requires full participation")
-    if canonical and (a.dmax!="4" or initial!="canonical_er" or topo!=5 or ev!=5 or batch!=32 or epochs!=1 or steps is not None): raise ValueError("canonical protocol requires D_max=4, canonical_er, intervals=5, batch=32, and one local epoch")
+    if canonical and (a.dmax!="4" or initial!="canonical_er" or topo!=5 or ev!=5 or batch!=32 or epochs!=1 or steps is not None or a.update_mode!="sequential" or a.data_regime!="fixed_total" or a.link_failure_rate!=0 or a.stale_view_rounds!=0): raise ValueError("canonical protocol requires D_max=4, canonical_er, sequential/full/fixed-total, no failures/staleness, intervals=5, batch=32, and one local epoch")
     if a.method=="dissdl" and a.num_clients>a.dissdl_max_n: raise ValueError("DissDL disabled above --dissdl-max-n due to its all-client known-peer directory")
     if a.method=="fedavg" and initial=="bounded_connected": initial="canonical_er"
-    return Config(a.method,a.num_clients,a.seed,rounds,a.protocol,a.alpha,a.dmax,dmax,topo,ev,initial,a.participation_rate,epochs,steps,batch,a.lr,a.output_dir,a.checkpoint_interval,a.checkpoint_path,a.resume,a.force,a.eval_clients,a.final_eval_all,a.data_root,a.update_mode,minimum,a.target_accuracy,a.graph_metric_interval,a.dissdl_max_n,a.num_workers)
+    return Config(a.method,a.num_clients,a.seed,rounds,a.protocol,a.alpha,a.dmax,dmax,topo,ev,initial,a.participation_rate,epochs,steps,batch,a.lr,a.output_dir,a.checkpoint_interval,a.checkpoint_path,a.resume,a.force,a.eval_clients,a.final_eval_all,a.data_root,a.update_mode,minimum,a.target_accuracy,a.graph_metric_interval,a.dissdl_max_n,a.num_workers,a.samples_per_client,a.link_failure_rate,a.stale_view_rounds,a.repair_warning_fraction,data_regime=a.data_regime)
 
 def main():
     try: return run(make_config(parser().parse_args()))

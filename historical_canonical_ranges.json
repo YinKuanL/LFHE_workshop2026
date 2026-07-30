@@ -1,0 +1,13 @@
+{
+  "source": "../Program/Baseline_comparison/cifar10_<method>_seed<42-46>.npy",
+  "criterion": "final accuracy must lie within the observed five-seed minimum and maximum",
+  "representation_shape": [10, 256],
+  "representation_dimension": 2560,
+  "methods": {
+    "ring": {"min": 0.5093533333333332, "max": 0.54176},
+    "static_random": {"min": 0.64904, "max": 0.6957366666666667},
+    "epidemic": {"min": 0.6819133333333335, "max": 0.7238333333333334},
+    "dissdl": {"min": 0.61671, "max": 0.6707666666666665},
+    "lfhe": {"min": 0.6880433333333336, "max": 0.7520766666666667}
+  }
+}

@@ -6,8 +6,8 @@
 #SBATCH --time=12:00:00
 #SBATCH --signal=B:USR1@180
 #SBATCH --requeue
-#SBATCH --array=1-3%1
+#SBATCH --array=1-6%3
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
-export MANIFEST=manifests/n1000_feasibility.csv
+export MANIFEST=manifests/stage07_fof_disconnected_limit.csv
 source slurm/manifest_worker.sh

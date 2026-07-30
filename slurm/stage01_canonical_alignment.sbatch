@@ -9,5 +9,5 @@
 #SBATCH --array=1-25%4
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --error=logs/%x_%A_%a.err
-export MANIFEST=manifests/canonical_alignment.csv
+export MANIFEST=manifests/stage01_canonical_alignment.csv
 source slurm/manifest_worker.sh
