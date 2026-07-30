@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Datasets
+data/
+datasets/
+
+# Experiment outputs
+outputs/
+checkpoints/
+scalability_checkpoints/
+logs/
+slurm-*.out
+*.out
+*.err
+
+# Model/checkpoint files
+*.pt
+*.pth
+*.ckpt
+
+# Result arrays
+*.npy
+*.npz
+
+# Generated plots
+*.png
+*.pdf
+
+# Temporary files
+*.tmp
+*.temp
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
