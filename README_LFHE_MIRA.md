@@ -106,6 +106,99 @@ A 1000-client checkpoint is large because it contains 1000 model states. Use a
 project/scratch filesystem with sufficient quota. Do not write checkpoints to a
 small home directory. Set `--output-dir` to the appropriate Mira storage path.
 
+
+## Submit, monitor, stop, and resume
+
+### Submit
+
+```bash
+sbatch run_lfhe_1000.sbatch
+METHOD=lfhe SEED=42 NCLIENTS=1000 sbatch run_lfhe_1000.sbatch
+mkdir -p logs
+sbatch run_scaling_array.sbatch
+```
+
+Record the returned job ID.
+
+### Monitor
+
+```bash
+squeue -u "$USER"
+watch -n 5 'squeue -u "$USER"'
+squeue -u "$USER" -o "%.18i %.20j %.2t %.10M %.10l %.12R"
+scontrol show job <JOB_ID>
+```
+
+`PD (Priority)` or `PD (Resources)` means waiting, not failure.
+
+### Follow logs
+
+```bash
+ls -lhtr logs | tail
+tail -f logs/<log-file>.out
+tail -n 100 logs/<log-file>.out
+grep -RniE "error|exception|traceback|out of memory|oom|nan|killed" logs
+```
+
+### Check progress and storage
+
+```bash
+find outputs -name SUCCESS | wc -l
+find outputs -name checkpoint.pt | wc -l
+du -sh outputs
+du -h --max-depth=2 outputs | sort -h | tail
+quota -s
+```
+
+For the newer runner:
+
+```bash
+tail -n 1 <output-dir>/metrics.jsonl | python -m json.tool
+python -m json.tool <output-dir>/summary.json
+```
+
+### Resource accounting
+
+```bash
+sacct -j <JOB_ID> \
+  --format=JobID,JobName%30,State,Elapsed,Timelimit,AllocTRES,MaxRSS,ExitCode
+```
+
+For arrays:
+
+```bash
+sacct -j <ARRAY_JOB_ID> \
+  --format=JobID%20,State,Elapsed,MaxRSS,ExitCode
+```
+
+### Safely pause and resume
+
+A running process continues using the code loaded when it started.
+
+```bash
+scancel --signal=USR1 <JOB_ID>
+ls -lh --time-style=long-iso <output-dir>/checkpoint.pt
+```
+
+If needed:
+
+```bash
+scancel <JOB_ID>
+```
+
+Resume with identical arguments and the same output directory:
+
+```bash
+python lfhe_scalable_experiment.py <same arguments> \
+  --output-dir <same-output-dir> \
+  --resume
+```
+
+Do not start two jobs that write to the same output directory.
+
+A run is complete only when `SUCCESS` exists. A directory with `checkpoint.pt` but no `SUCCESS` is incomplete and should be resumed.
+
+
 ## Recommended order
 
 1. 5-round smoke test at N=1000.

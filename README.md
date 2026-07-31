@@ -56,6 +56,289 @@ Each manifest row has an independent output directory. No script submits a later
 
 Feasibility promotion requires: projected 300-round runtime no more than 48 hours; peak CPU RSS no more than 22.4 GiB; GPU reserved memory below 90% of device capacity; checkpoint no more than 10 GiB and 600 seconds; full evaluation no more than three hours; partition repair fraction no more than 5%; and no NaN, degree-safety, checkpoint, or completion failure. N=1500/2000 failures are reported as system limits rather than weakening the N≤1000 headline.
 
+
+## Running and monitoring experiments on NCC / Mira
+
+### Before submission
+
+```bash
+source .venv/bin/activate
+mkdir -p logs outputs
+python generate_manifests.py
+```
+
+A login node may report that CUDA is unavailable. Confirm GPU access inside an allocation:
+
+```bash
+srun --partition=ug-gpu-small --gres=gpu:ampere:1 \
+  --cpus-per-task=4 --mem=28G --time=00:10:00 \
+  python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
+```
+
+Run a short GPU smoke test first:
+
+```bash
+srun --partition=ug-gpu-small --gres=gpu:ampere:1 \
+  --cpus-per-task=4 --mem=28G --time=00:20:00 \
+  python main.py \
+    --protocol scalable \
+    --method lfhe \
+    --num-clients 10 \
+    --seed 42 \
+    --rounds 2 \
+    --dmax 4 \
+    --initial-graph bounded_connected \
+    --participation-rate 1 \
+    --local-epochs 1 \
+    --batch-size 32 \
+    --topology-interval 1 \
+    --eval-interval 1 \
+    --eval-clients 10 \
+    --output-dir outputs/gpu_smoke \
+    --data-root ./data
+```
+
+### Recommended staged execution
+
+Submit and validate stages in order:
+
+```bash
+sbatch slurm/stage01_canonical_alignment.sbatch
+
+python validate_stage.py \
+  --kind canonical \
+  --manifest manifests/stage01_canonical_alignment.csv
+
+sbatch slurm/stage02_feasibility_5round.sbatch
+
+python validate_stage.py \
+  --kind feasibility \
+  --manifest manifests/stage02_feasibility_5round.csv
+
+# Only when additional evidence is needed:
+sbatch slurm/stage03_feasibility_20round.sbatch
+
+# Submit after feasibility passes:
+sbatch slurm/stage04_primary_fixed_d4_seeds42_44.sbatch
+```
+
+Do not submit every expensive stage at once. Use an array concurrency limit such as `%4` or `%6`.
+
+### Run the complete configured suite
+
+Preview first:
+
+```bash
+python main_all_experiments.py \
+  --run-all \
+  --suite all \
+  --results-root "$SCRATCH/LFHE_workshop_results" \
+  --data-root "$SCRATCH/LFHE_data" \
+  --dry-run
+```
+
+Run:
+
+```bash
+python main_all_experiments.py \
+  --run-all \
+  --suite all \
+  --results-root "$SCRATCH/LFHE_workshop_results" \
+  --data-root "$SCRATCH/LFHE_data"
+```
+
+Rerun behavior:
+
+- completed experiments with `SUCCESS` are skipped;
+- incomplete experiments with `checkpoint.pt` are resumed;
+- new experiments start from round 0;
+- `--force` restarts an experiment and removes its previous artifacts.
+
+Never run two processes against the same output directory.
+
+The current suite only includes methods implemented in the repository. Morph must be connected through its actual implementation before being included; Random-FoF must not be used as a substitute.
+
+### Monitor SLURM jobs
+
+```bash
+squeue -u "$USER"
+watch -n 5 'squeue -u "$USER"'
+```
+
+Show useful columns:
+
+```bash
+squeue -u "$USER" \
+  -o "%.18i %.20j %.2t %.10M %.10l %.12R"
+```
+
+Common states:
+
+- `PD`: pending;
+- `R`: running;
+- `CG`: completing;
+- `CD`: completed;
+- `F`: failed;
+- `CA`: cancelled;
+- `TO`: time limit;
+- `OOM`: out of memory.
+
+`PD (Priority)` or `PD (Resources)` normally means waiting, not failure.
+
+Inspect one job:
+
+```bash
+scontrol show job <JOB_ID>
+```
+
+Inspect one array task:
+
+```bash
+scontrol show job <ARRAY_JOB_ID>_<TASK_ID>
+```
+
+### Follow logs
+
+```bash
+ls -lhtr logs | tail
+tail -f logs/<log-file>.out
+tail -n 100 logs/<log-file>.out
+```
+
+Search for failures:
+
+```bash
+grep -RniE "error|exception|traceback|out of memory|oom|nan|killed" logs
+```
+
+Find the newest logs:
+
+```bash
+find logs -type f -printf '%T@ %p\n' | sort -n | tail
+```
+
+A quiet stdout file does not always mean the job is stuck because Python output may be buffered. Also check whether `metrics.jsonl` and `checkpoint.pt` timestamps are changing.
+
+### Monitor output progress
+
+Count completed experiments:
+
+```bash
+find "$SCRATCH/LFHE_workshop_results" -name SUCCESS | wc -l
+```
+
+Count checkpoints:
+
+```bash
+find "$SCRATCH/LFHE_workshop_results" -name checkpoint.pt | wc -l
+```
+
+List checkpointed but incomplete runs:
+
+```bash
+find "$SCRATCH/LFHE_workshop_results" -name checkpoint.pt -print0 |
+while IFS= read -r -d '' cp; do
+  dir="$(dirname "$cp")"
+  test -f "$dir/SUCCESS" || echo "$dir"
+done
+```
+
+Inspect the latest round:
+
+```bash
+tail -n 1 <experiment-output-dir>/metrics.jsonl | python -m json.tool
+```
+
+Inspect the final summary:
+
+```bash
+python -m json.tool <experiment-output-dir>/summary.json
+```
+
+Check storage:
+
+```bash
+du -sh "$SCRATCH/LFHE_workshop_results"
+du -h --max-depth=2 "$SCRATCH/LFHE_workshop_results" | sort -h | tail
+quota -s
+```
+
+### Inspect resource usage
+
+After a job finishes or leaves the queue:
+
+```bash
+sacct -j <JOB_ID> \
+  --format=JobID,JobName%30,State,Elapsed,Timelimit,AllocTRES,MaxRSS,ExitCode
+```
+
+For an array:
+
+```bash
+sacct -j <ARRAY_JOB_ID> \
+  --format=JobID%20,State,Elapsed,MaxRSS,ExitCode
+```
+
+While running, where supported:
+
+```bash
+sstat -j <JOB_ID>.batch \
+  --format=JobID,AveCPU,MaxRSS,AveRSS
+```
+
+On an interactive GPU node:
+
+```bash
+watch -n 2 nvidia-smi
+```
+
+### Safely stop and resume
+
+A running process keeps using the code loaded when it started. Editing `main.py` does not update that running process.
+
+Ask the job to checkpoint:
+
+```bash
+scancel --signal=USR1 <JOB_ID>
+```
+
+Verify the checkpoint timestamp:
+
+```bash
+ls -lh --time-style=long-iso <experiment-output-dir>/checkpoint.pt
+```
+
+If it does not exit or requeue automatically:
+
+```bash
+scancel <JOB_ID>
+```
+
+Resume a single run with exactly the same scientific arguments and output directory:
+
+```bash
+python main.py <same arguments as before> \
+  --output-dir <same-output-dir> \
+  --resume
+```
+
+Resume the whole suite by rerunning the same `main_all_experiments.py` command.
+
+Do not resume an old checkpoint if training, data partitioning, aggregation, LFHE fitness, representation, or topology behavior changed. Use a new output root or restart that experiment with `--force`.
+
+### Fast diagnosis checklist
+
+1. Check whether the job is pending or running with `squeue`.
+2. Read the scheduler reason with `scontrol show job`.
+3. Check whether the log file is growing.
+4. Check timestamps of `metrics.jsonl` and `checkpoint.pt`.
+5. Inspect `sacct` or `sstat` for memory and exit-code problems.
+6. Check quota and checkpoint size.
+7. Stop or resubmit only after these checks.
+
+An SSH disconnection does not terminate an `sbatch` job.
+
+
 ## Smoke tests
 
 Tiny CPU runs (CIFAR-10 must already be available, or allow its download):
