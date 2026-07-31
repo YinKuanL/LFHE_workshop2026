@@ -66,8 +66,8 @@ def load_cifar(root):
     train_tf=transforms.Compose([transforms.RandomCrop(32,padding=4),transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),transforms.Normalize([.4914,.4822,.4465],[.2023,.1994,.2010])])
     test_tf=transforms.Compose([transforms.ToTensor(),transforms.Normalize([.4914,.4822,.4465],[.2023,.1994,.2010])])
-    return (datasets.CIFAR10(root,train=True,download=True,transform=train_tf),
-            datasets.CIFAR10(root,train=False,download=True,transform=test_tf))
+    return (datasets.CIFAR10(root,train=True,download=False,transform=train_tf),
+            datasets.CIFAR10(root,train=False,download=False,transform=test_tf))
 
 def dirichlet_split(labels, n, alpha, minimum, seed, preserve_original=False, max_attempts=1000,
                     return_stats=False, samples_per_client=None):
@@ -599,7 +599,7 @@ def parser():
     p.add_argument("--rounds",type=int); p.add_argument("--protocol",choices=("canonical","scalable"),required=True); p.add_argument("--alpha",type=float,default=.1); p.add_argument("--dmax",default="4",choices=("2","4","8","log2")); p.add_argument("--topology-interval",type=int); p.add_argument("--eval-interval",type=int)
     p.add_argument("--initial-graph",choices=("canonical_er","bounded_connected","clustered","disconnected_clusters")); p.add_argument("--participation-rate",type=float,default=1.); group=p.add_mutually_exclusive_group(); group.add_argument("--local-epochs",type=int); group.add_argument("--local-steps",type=int)
     p.add_argument("--batch-size",type=int); p.add_argument("--lr",type=float,default=.05); p.add_argument("--output-dir",required=True); p.add_argument("--checkpoint-interval",type=int,default=10); p.add_argument("--checkpoint-path",default=""); p.add_argument("--resume",action="store_true"); p.add_argument("--force",action="store_true")
-    p.add_argument("--eval-clients",type=int,default=50); p.add_argument("--final-eval-all",action=argparse.BooleanOptionalAction,default=True); p.add_argument("--data-root",default=os.getenv("LFHE_DATA_ROOT","./data")); p.add_argument("--update-mode",choices=("sequential","snapshot_concurrent"),default="sequential")
+    p.add_argument("--eval-clients",type=int,default=50); p.add_argument("--final-eval-all",dest="final_eval_all",action="store_true"); p.add_argument("--no-final-eval-all",dest="final_eval_all",action="store_false"); p.set_defaults(final_eval_all=True); p.add_argument("--data-root",default=os.getenv("LFHE_DATA_ROOT","./data")); p.add_argument("--update-mode",choices=("sequential","snapshot_concurrent"),default="sequential")
     p.add_argument("--data-regime",choices=("fixed_total","fixed_per_client"),default="fixed_total"); p.add_argument("--samples-per-client",type=int)
     p.add_argument("--link-failure-rate",type=float,default=0.); p.add_argument("--stale-view-rounds",type=int,default=0); p.add_argument("--repair-warning-fraction",type=float,default=.05)
     p.add_argument("--min-samples-per-client",type=int); p.add_argument("--target-accuracy",type=float,default=.65); p.add_argument("--graph-metric-interval",type=int,default=25); p.add_argument("--dissdl-max-n",type=int,default=500); p.add_argument("--num-workers",type=int,default=0); return p

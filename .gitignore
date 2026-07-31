@@ -39,3 +39,4 @@ slurm-*.out
 .idea/
 .DS_Store
 Thumbs.db
+stage*_job_id.txt
