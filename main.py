@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Canonical-compatible and scalable LFHE CIFAR-10 experiment runner."""
+"""Canonical-compatible LFHE runner with resumable all-suite execution."""
 from __future__ import annotations
 import argparse, copy, hashlib, json, math, os, random, signal, sys, time
 from dataclasses import asdict, dataclass
@@ -483,6 +483,117 @@ def checkpoint_payload(cfg,next_round,states,graph,splits,records,diss,pstats,in
       "data_split":splits,"metrics":records,"rng":rng_state(),"configuration":asdict(cfg),"experiment_id":config_hash(cfg),"active_client_sampler_state":random.getstate(),
       "lfhe_state":{"update_mode":cfg.update_mode,"representation_history":rep_history or []},"baseline_state":[x.checkpoint() for x in diss],"partition_stats":pstats,"initial_graph_stats":initial}
 
+
+
+def experiment_complete(output_dir: str | Path) -> bool:
+    """Return True only when both SUCCESS and a complete summary are present."""
+    out=Path(output_dir); success=out/"SUCCESS"; summary=out/"summary.json"
+    if not success.exists() or not summary.exists(): return False
+    try:
+        payload=json.loads(summary.read_text(encoding="utf-8"))
+        return payload.get("status")=="complete"
+    except (OSError,json.JSONDecodeError):
+        return False
+
+
+def parse_int_csv(value):
+    return tuple(int(x.strip()) for x in value.split(",") if x.strip())
+
+
+def batch_parser():
+    p=argparse.ArgumentParser(description="Run every LFHE workshop experiment from one command.")
+    p.add_argument("--run-all",action="store_true",required=True)
+    p.add_argument("--suite",choices=("all","canonical","feasibility","primary","degree","partial"),default="all")
+    p.add_argument("--results-root",default="./results/workshop_all")
+    p.add_argument("--data-root",default=os.getenv("LFHE_DATA_ROOT","./data"))
+    p.add_argument("--seeds",default="42,43,44",help="Seeds for scalable suites.")
+    p.add_argument("--canonical-seeds",default="42,43,44,45,46")
+    p.add_argument("--primary-clients",default="100,200,500,1000,1500,2000")
+    p.add_argument("--degree-clients",default="100,500,1000,2000")
+    p.add_argument("--partial-clients",default="1000,1500,2000")
+    p.add_argument("--force",action="store_true",help="Delete and rerun completed/incomplete outputs.")
+    p.add_argument("--continue-on-error",action=argparse.BooleanOptionalAction,default=True)
+    p.add_argument("--dry-run",action="store_true")
+    return p
+
+
+def _spec(method,n,seed,protocol,rounds,stage,**kwargs):
+    return {"method":method,"num_clients":n,"seed":seed,"protocol":protocol,
+            "rounds":rounds,"stage":stage,**kwargs}
+
+
+def build_workshop_specs(a):
+    seeds=parse_int_csv(a.seeds); canonical_seeds=parse_int_csv(a.canonical_seeds)
+    primary_clients=parse_int_csv(a.primary_clients); degree_clients=parse_int_csv(a.degree_clients)
+    partial_clients=parse_int_csv(a.partial_clients); specs=[]
+    selected={a.suite} if a.suite!="all" else {"canonical","feasibility","primary","degree","partial"}
+    if "canonical" in selected:
+        # Morph is intentionally not faked here: add it once its implementation/API is supplied.
+        for method in ("ring","static_random","epidemic","dissdl","random_fof","lfhe"):
+            for seed in canonical_seeds: specs.append(_spec(method,30,seed,"canonical",300,"canonical"))
+    if "feasibility" in selected:
+        for n in (100,500,1000,1500,2000):
+            for method in ("static_random","lfhe"):
+                specs.append(_spec(method,n,seeds[0],"scalable",5,"feasibility_full"))
+        for n in partial_clients:
+            for method in ("static_random","lfhe"):
+                specs.append(_spec(method,n,seeds[0],"scalable",5,"feasibility_partial",participation_rate=.1))
+    if "primary" in selected:
+        for n in primary_clients:
+            for method in ("static_random","random_fof","lfhe"):
+                for seed in seeds: specs.append(_spec(method,n,seed,"scalable",300,"primary"))
+    if "degree" in selected:
+        for n in degree_clients:
+            for dmax in ("2","4","8","log2"):
+                for method in ("static_random","random_fof","lfhe"):
+                    for seed in seeds: specs.append(_spec(method,n,seed,"scalable",300,"degree",dmax=dmax))
+    if "partial" in selected:
+        for n in partial_clients:
+            for method in ("static_random","lfhe"):
+                for seed in seeds: specs.append(_spec(method,n,seed,"scalable",300,"partial",participation_rate=.1))
+    return specs
+
+
+def namespace_from_spec(spec,a):
+    stage=spec["stage"]; dmax=spec.get("dmax","4"); participation=spec.get("participation_rate",1.)
+    suffix=f"n{spec['num_clients']}_seed{spec['seed']}_d{dmax}_p{participation:g}"
+    output=Path(a.results_root)/stage/spec["method"]/suffix
+    # Construct the same argparse namespace expected by make_config.
+    return argparse.Namespace(method=spec["method"],num_clients=spec["num_clients"],seed=spec["seed"],
+      rounds=spec["rounds"],protocol=spec["protocol"],alpha=.1,dmax=dmax,topology_interval=None,
+      eval_interval=None,initial_graph=None,participation_rate=participation,local_epochs=None,
+      local_steps=None,batch_size=None,lr=.05,output_dir=str(output),checkpoint_interval=10,
+      checkpoint_path="",resume=(output/"checkpoint.pt").exists(),force=a.force,eval_clients=50,
+      final_eval_all=True,data_root=a.data_root,update_mode="sequential",data_regime="fixed_total",
+      samples_per_client=None,link_failure_rate=0.,stale_view_rounds=0,repair_warning_fraction=.05,
+      min_samples_per_client=None,target_accuracy=.65,graph_metric_interval=25,dissdl_max_n=500,
+      num_workers=0)
+
+
+def run_all(a):
+    specs=build_workshop_specs(a); total=len(specs); skipped=completed=failed=0
+    print(f"[suite] {a.suite}: {total} experiments",flush=True)
+    for index,spec in enumerate(specs,1):
+        ns=namespace_from_spec(spec,a); out=Path(ns.output_dir)
+        label=f"[{index}/{total}] {spec['stage']} {spec['method']} N={spec['num_clients']} seed={spec['seed']}"
+        if experiment_complete(out) and not a.force:
+            print(f"[skip-complete] {label}",flush=True); skipped+=1; continue
+        if (out/"checkpoint.pt").exists() and not a.force:
+            ns.resume=True; print(f"[resume] {label}",flush=True)
+        else: print(f"[run] {label}",flush=True)
+        if a.dry_run: continue
+        try:
+            code=run(make_config(ns))
+            if code==EXIT_REQUEUE:
+                print(f"[stopped] checkpoint saved for {label}",flush=True); return code
+            if code!=0: raise RuntimeError(f"experiment exited with code {code}")
+            completed+=1
+        except Exception as exc:
+            failed+=1; print(f"[failed] {label}: {type(exc).__name__}: {exc}",file=sys.stderr,flush=True)
+            if not a.continue_on_error: return 2
+    print(f"[suite-done] newly_completed={completed} skipped={skipped} failed={failed}",flush=True)
+    return 0 if failed==0 else 2
+
 def parser():
     p=argparse.ArgumentParser(description=__doc__); p.add_argument("--method",choices=METHODS,required=True); p.add_argument("--num-clients",type=int,required=True); p.add_argument("--seed",type=int,required=True)
     p.add_argument("--rounds",type=int); p.add_argument("--protocol",choices=("canonical","scalable"),required=True); p.add_argument("--alpha",type=float,default=.1); p.add_argument("--dmax",default="4",choices=("2","4","8","log2")); p.add_argument("--topology-interval",type=int); p.add_argument("--eval-interval",type=int)
@@ -511,6 +622,8 @@ def make_config(a):
     return Config(a.method,a.num_clients,a.seed,rounds,a.protocol,a.alpha,a.dmax,dmax,topo,ev,initial,a.participation_rate,epochs,steps,batch,a.lr,a.output_dir,a.checkpoint_interval,a.checkpoint_path,a.resume,a.force,a.eval_clients,a.final_eval_all,a.data_root,a.update_mode,minimum,a.target_accuracy,a.graph_metric_interval,a.dissdl_max_n,a.num_workers,a.samples_per_client,a.link_failure_rate,a.stale_view_rounds,a.repair_warning_fraction,data_regime=a.data_regime)
 
 def main():
-    try: return run(make_config(parser().parse_args()))
+    try:
+        if "--run-all" in sys.argv[1:]: return run_all(batch_parser().parse_args())
+        return run(make_config(parser().parse_args()))
     except (ValueError,RuntimeError) as exc: print(f"error: {exc}",file=sys.stderr); return 2
 if __name__=="__main__": raise SystemExit(main())
