@@ -10,6 +10,7 @@ datasets/
 
 # Experiment outputs
 outputs/
+results/
 checkpoints/
 scalability_checkpoints/
 logs/
@@ -33,6 +34,14 @@ slurm-*.out
 # Temporary files
 *.tmp
 *.temp
+*_job_id.txt
+
+# Local archives
+LFHE_Mira_1000_clients.zip
+*.zip
+*.tar
+*.tar.gz
+*.7z
 
 # IDE / OS
 .vscode/
@@ -40,3 +49,7 @@ slurm-*.out
 .DS_Store
 Thumbs.db
 stage*_job_id.txt
+Desktop.ini
+*.swp
+*.swo
+*~

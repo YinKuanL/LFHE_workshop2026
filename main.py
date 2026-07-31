@@ -16,9 +16,16 @@ from epidemic import build_epidemic_graph
 from dissdl import DissDLState
 from lfhe import lfhe_update
 
+try:
+    from morph import MorphNode
+    MORPH_IMPORT_ERROR = None
+except ImportError as exc:
+    MorphNode = None
+    MORPH_IMPORT_ERROR = exc
+
 EXIT_REQUEUE = 99
 STOP_SIGNAL = None
-METHODS = ("ring", "static_random", "epidemic", "dissdl", "random_fof", "lfhe", "fedavg")
+METHODS = ("ring", "static_random", "epidemic", "dissdl", "random_fof", "morph", "lfhe", "fedavg")
 
 def _stop(signum, _frame):
     global STOP_SIGNAL
@@ -47,7 +54,7 @@ class Config:
     final_eval_all:bool; data_root:str; update_mode:str; min_samples_per_client:int
     target_accuracy:float; graph_metric_interval:int; dissdl_max_n:int; num_workers:int
     samples_per_client:int|None; link_failure_rate:float; stale_view_rounds:int
-    repair_warning_fraction:float
+    repair_warning_fraction:float; representation_mode:str; lfhe_start_round:int
     w1:float=1.; w2:float=1.; w3:float=.1; epsilon:float=.05
     dataset:str="cifar10"; data_regime:str="fixed_total"; optimizer:str="SGD"
 
@@ -140,6 +147,13 @@ def clustered_hard(n,dmax,seed,connected=True):
     return g
 
 def initial_graph(cfg):
+    if cfg.method=="morph":
+        if cfg.dmax>=cfg.num_clients: raise ValueError("Morph in-degree must be smaller than num-clients")
+        rng=random.Random(cfg.seed); graph=nx.DiGraph(); graph.add_nodes_from(range(cfg.num_clients))
+        for receiver in range(cfg.num_clients):
+            peers=[i for i in range(cfg.num_clients) if i!=receiver]
+            graph.add_edges_from((sender,receiver) for sender in rng.sample(peers,cfg.dmax))
+        return graph
     if cfg.method=="ring": return nx.cycle_graph(cfg.num_clients)
     if cfg.method=="epidemic" and cfg.protocol=="canonical": return build_epidemic_graph(cfg.num_clients,cfg.dmax,cfg.seed)
     if cfg.method=="dissdl" and cfg.protocol=="canonical":
@@ -212,11 +226,67 @@ def epidemic_aggregate(states,g,active):
     return tx
 
 class _RepresentationModel:
-    def __init__(self,state): self.weight=state["classifier.4.weight"] if isinstance(state,dict) else state
-    def get_representation(self): return self.weight.flatten()
+    def __init__(self,state,mode="flatten"):
+        self.weight=state["classifier.4.weight"] if isinstance(state,dict) else state
+        self.mode=mode
+    def get_representation(self):
+        if self.mode=="class_mean":
+            return self.weight.mean(dim=1).flatten()
+        return self.weight.flatten()
 class Adapter:
-    """Lightweight canonical LFHE interface; does not allocate another CNN."""
-    def __init__(self,state): self.model=_RepresentationModel(state)
+    """Lightweight LFHE/Morph interface; does not allocate another CNN."""
+    def __init__(self,state,mode="flatten"): self.model=_RepresentationModel(state,mode)
+
+def make_morph_nodes(states, graph, cfg):
+    nodes=[]
+    for i,state in enumerate(states):
+        model=CNN(); model.load_state_dict(state)
+        nodes.append(MorphNode(i,model,list(graph.predecessors(i)),in_degree=cfg.dmax,
+            beta=500.0,change_iter=cfg.topology_interval,seed=cfg.seed,
+            indirect_history_k=5,device=torch.device("cpu")))
+    return nodes
+
+def morph_round(states, nodes, active, round_index):
+    """Execute the MorphNode protocol used by morph_matched_rerun.py."""
+    active=set(active)
+    for i in active:
+        nodes[i].model.load_state_dict(states[i],strict=True)
+        nodes[i].begin_round(round_index)
+        nodes[i].update_wanted_senders(round_index,available_peers=active)
+        nodes[i].validate_state()
+    payloads={i:nodes[i].build_model_payload(degree=len(nodes[i].wanted_senders)) for i in active}
+    transmissions=0
+    for receiver in active:
+        node=nodes[receiver]
+        for sender in node.requested_senders():
+            if sender in active and nodes[sender].should_send_to(receiver,True):
+                node.receive_model_payload(sender,payloads[sender]); transmissions+=1
+    for i in active:
+        nodes[i].aggregate(); states[i]=clone_state(nodes[i].model.state_dict())
+    graph=nx.DiGraph(); graph.add_nodes_from(range(len(nodes)))
+    for receiver,node in enumerate(nodes):
+        graph.add_edges_from((sender,receiver) for sender in node.wanted_senders)
+    return graph,transmissions
+
+def morph_checkpoint(nodes):
+    return [{"wanted_senders":sorted(n.wanted_senders),"known_nodes":sorted(n.known_nodes),
+      "peer_models":n.peer_models,"has_real_model":sorted(n.has_real_model),
+      "similarity_cache":n.similarity_cache,
+      "sim_estimates":{peer:list(values) for peer,values in n.sim_estimates_per_peer.items()},
+      "iteration":n.iteration,"last_added_peer":n.last_added_peer,"last_removed_peer":n.last_removed_peer,
+      "topology_change_count":n.topology_change_count,"rng_state":n.rng.getstate()} for n in nodes]
+
+def restore_morph_nodes(states, graph, cfg, saved):
+    nodes=make_morph_nodes(states,graph,cfg)
+    for node,value in zip(nodes,saved):
+        node.wanted_senders=set(value["wanted_senders"]); node.known_nodes=set(value["known_nodes"])
+        node.peer_models=value["peer_models"]; node.has_real_model=set(value["has_real_model"])
+        node.similarity_cache=value["similarity_cache"]; node.sim_estimates_per_peer.clear()
+        for peer,estimates in value["sim_estimates"].items(): node.sim_estimates_per_peer[int(peer)].extend(estimates)
+        node.iteration=value["iteration"]; node.last_added_peer=value["last_added_peer"]
+        node.last_removed_peer=value["last_removed_peer"]; node.topology_change_count=value["topology_change_count"]
+        node.rng.setstate(value["rng_state"])
+    return nodes
 
 def fof_update(g, active, dmax, random_policy=False):
     g=g.copy(); trace=[]
@@ -374,7 +444,7 @@ def summarize(cfg, records, started, pstats, initial, final, deployment, checkpo
       "topology_stabilization_round":(accepted[-1]+1) if accepted else 0,
       "resource_projection":{"mean_round_seconds":mean_round,"projected_300_round_seconds":projected,"peak_cpu_rss_bytes":peak_rss,"peak_gpu_reserved_bytes":peak_gpu,"checkpoint_bytes":checkpoint_bytes,"max_checkpoint_seconds":checkpoint_seconds,"final_full_evaluation_seconds":final_eval},
       "feasibility_gate":{"passed":all(gate_checks.values()),"checks":gate_checks},
-      "scientific_notes":["canonical LFHE fitness/annealing/representation" if cfg.method=="lfhe" else "matched baseline budget"]}
+      "scientific_notes":["canonical LFHE fitness/annealing/representation" if cfg.method=="lfhe" else "real Morph topology implementation" if cfg.method=="morph" else "matched baseline budget"]}
 
 def run(cfg):
     set_seed(cfg.seed); out=Path(cfg.output_dir); success=out/"SUCCESS"
@@ -394,12 +464,13 @@ def run(cfg):
         records=saved["metrics"]; diss=[DissDLState.restore(x) for x in saved.get("baseline_state",[])]; restore_rng(saved["rng"])
         rep_history=saved.get("lfhe_state",{}).get("representation_history",[])
         pstats=saved["partition_stats"]; initial=saved["initial_graph_stats"]
+        morph_nodes=restore_morph_nodes(states,graph,cfg,saved.get("morph_state",[])) if cfg.method=="morph" else []
     else:
         samples=cfg.samples_per_client if cfg.data_regime=="fixed_per_client" else None
         splits,split_meta=dirichlet_split(labels,cfg.num_clients,cfg.alpha,cfg.min_samples_per_client,cfg.seed,cfg.protocol=="canonical",return_stats=True,samples_per_client=samples)
         pstats={**partition_stats(labels,splits),**split_meta}; pstats["repair_warning"]=pstats["repaired_sample_fraction"]>cfg.repair_warning_fraction
         states=initial_states(cfg.num_clients,cfg.seed); graph=initial_graph(cfg); start=0; records=[]; rep_history=[]
-        diss=[]
+        diss=[]; morph_nodes=[]
         if cfg.method=="dissdl":
             for i in range(cfg.num_clients):
                 peers=set(range(cfg.num_clients))-{i}; initial_senders=set(graph.predecessors(i)) if graph.is_directed() else set(graph.neighbors(i)); diss.append(DissDLState(initial_senders,peers))
@@ -407,10 +478,12 @@ def run(cfg):
                 directed=nx.DiGraph(); directed.add_nodes_from(range(cfg.num_clients))
                 for i,node in enumerate(diss): directed.add_edges_from((j,i) for j in node.wanted_senders)
                 graph=directed
+        if cfg.method=="morph": morph_nodes=make_morph_nodes(states,graph,cfg)
         initial=graph_stats(graph); initial["over_cap_nodes"]=sum(d>cfg.dmax for _,d in graph.degree())
-        representation_dimension=int(states[0]["classifier.4.weight"].numel())
+        representation_shape=list(states[0]["classifier.4.weight"].shape)
+        representation_dimension=(representation_shape[0] if cfg.representation_mode=="class_mean" else int(states[0]["classifier.4.weight"].numel()))
         resolved_initial="dissdl_random_in_degree_3" if cfg.protocol=="canonical" and cfg.method=="dissdl" else "epidemic_directed_degree_4" if cfg.protocol=="canonical" and cfg.method=="epidemic" else cfg.initial_graph
-        write_edges(out/"graph_initial.edgelist",graph); atomic_json(out/"config.json",{**asdict(cfg),"resolved_initial_graph":resolved_initial,"experiment_id":config_hash(cfg),"deployment_protocol":"partial_participation" if cfg.participation_rate<1 else "full_participation","representation_shape":list(states[0]["classifier.4.weight"].shape),"representation_dimension":representation_dimension})
+        write_edges(out/"graph_initial.edgelist",graph); atomic_json(out/"config.json",{**asdict(cfg),"resolved_initial_graph":resolved_initial,"experiment_id":config_hash(cfg),"deployment_protocol":"partial_participation" if cfg.participation_rate<1 else "full_participation","representation_shape":representation_shape,"representation_dimension":representation_dimension,"representation_mode":cfg.representation_mode,"lfhe_start_round":cfg.lfhe_start_round})
         print(f"[representation] shape={tuple(states[0]['classifier.4.weight'].shape)} flattened_dimension={representation_dimension}",flush=True)
     fixed_eval=random.Random(cfg.seed+991).sample(range(cfg.num_clients),min(cfg.eval_clients,cfg.num_clients))
     # The reusable execution model must not perturb training/dropout RNG state.
@@ -429,20 +502,21 @@ def run(cfg):
         for i in active: states[i]=train_client(working,states[i],train,splits[i],cfg,device,cfg.seed*1_000_003+rnd*cfg.num_clients+i)
         train_s=time.perf_counter()-t
         if STOP_SIGNAL is not None:
-            payload=checkpoint_payload(cfg,rnd,states,graph,splits,records,diss,pstats,initial,rep_history); atomic_checkpoint(cp,payload); return EXIT_REQUEUE
+            payload=checkpoint_payload(cfg,rnd,states,graph,splits,records,diss,pstats,initial,rep_history,morph_nodes); atomic_checkpoint(cp,payload); return EXIT_REQUEUE
         t=time.perf_counter()
         aggregation_graph,dropped_links=failed_link_view(graph,cfg.link_failure_rate,cfg.seed*10_000_019+rnd)
         if cfg.method=="fedavg": tx=fedavg(states,active)
         elif cfg.method=="epidemic": graph=build_epidemic_graph(cfg.num_clients,cfg.dmax,cfg.seed+rnd); aggregation_graph,dropped_links=failed_link_view(graph,cfg.link_failure_rate,cfg.seed*10_000_019+rnd); tx=epidemic_aggregate(states,aggregation_graph,active)
         elif cfg.method=="dissdl": tx=dissdl_aggregate(states,diss,active)
+        elif cfg.method=="morph": graph,tx=morph_round(states,morph_nodes,active,rnd); aggregation_graph=graph
         else: tx=aggregate(states,aggregation_graph,active)
         agg_s=time.perf_counter()-t; topo_s=0.; trace=[]; concurrency={"proposal_count":0,"shared_endpoint_conflicts":0,"shared_endpoint_conflict_rate":0.,"stale_rejections":0,"degree_safety_rejections":0,"committed_proposals":0}
         current_reps=torch.stack([s["classifier.4.weight"].clone() for s in states]); rep_history.append((rnd,current_reps)); rep_history=rep_history[-max(1,cfg.stale_view_rounds+1):]
-        canonical_lfhe_window=(cfg.protocol!="canonical" or cfg.method!="lfhe" or 20<rnd<300)
-        if rnd%cfg.topology_interval==0 and canonical_lfhe_window:
+        lfhe_window=(cfg.method!="lfhe" or rnd>=cfg.lfhe_start_round)
+        if cfg.method!="morph" and rnd%cfg.topology_interval==0 and lfhe_window:
             t=time.perf_counter()
             component_id={node:index for index,component in enumerate(nx.connected_components(graph.to_undirected())) for node in component}
-            view_index=max(0,len(rep_history)-1-cfg.stale_view_rounds); view_round,view_reps=rep_history[view_index]; clients=[Adapter(view_reps[i]) for i in range(cfg.num_clients)]
+            view_index=max(0,len(rep_history)-1-cfg.stale_view_rounds); view_round,view_reps=rep_history[view_index]; clients=[Adapter(view_reps[i],cfg.representation_mode) for i in range(cfg.num_clients)]
             if cfg.method=="lfhe" and cfg.update_mode=="snapshot_concurrent": graph,trace,concurrency=snapshot_concurrent_lfhe(graph,clients,active,cfg,rnd)
             elif cfg.method=="lfhe": graph=lfhe_update(graph,clients,cfg.epsilon,cfg.dmax,cfg.w1,cfg.w2,cfg.w3,rnd,trace,None if cfg.update_mode=="sequential" and cfg.participation_rate==1 else active)
             elif cfg.method=="random_fof": graph,trace=fof_update(graph,active,cfg.dmax,True)
@@ -457,7 +531,7 @@ def run(cfg):
              "topology_control_messages":control,"topology_control_bytes":control*16,"cumulative_bytes":cumulative,"local_training_seconds":train_s,
              "aggregation_seconds":agg_s,"topology_update_seconds":topo_s,"candidate_checks":control,
              "link_failure_rate":cfg.link_failure_rate,"failed_links":dropped_links,"effective_connected_components":effective_components,"effective_connected":effective_connected,"recovered_this_round":effective_connected and not previous_effective_connected,"recovery_rounds":recovery_rounds,
-             "stale_view_rounds":cfg.stale_view_rounds,"representation_view_round":view_round if rnd%cfg.topology_interval==0 and canonical_lfhe_window else None,**concurrency,
+             "stale_view_rounds":cfg.stale_view_rounds,"representation_view_round":view_round if rnd%cfg.topology_interval==0 and lfhe_window else None,**concurrency,
              "fitness_evaluations":sum(e.get("fitness_evaluations",0) for e in trace),"accepted_additions":sum(e.get("action","").endswith("accepted_addition") for e in trace),
              "accepted_swaps":sum(e.get("action","").endswith("accepted_swap") for e in trace),"rejected_proposals":sum(e.get("action","").startswith("rejected") for e in trace),
              "fof_cross_component_proposals":sum("candidate" in e and component_id.get(e.get("client"))!=component_id.get(e.get("candidate")) for e in trace),"fof_component_count":len(set(component_id.values()))}
@@ -472,16 +546,17 @@ def run(cfg):
         rec["peak_gpu_allocated_bytes"]=torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0; rec["peak_gpu_reserved_bytes"]=torch.cuda.max_memory_reserved() if torch.cuda.is_available() else 0
         records.append(rec)
         if (rnd+1)%cfg.checkpoint_interval==0 or STOP_SIGNAL is not None or rnd==cfg.rounds-1:
-            ct=time.perf_counter(); atomic_checkpoint(cp,checkpoint_payload(cfg,rnd+1,states,graph,splits,records,diss,pstats,initial,rep_history)); rec["checkpoint_seconds"]=time.perf_counter()-ct
+            ct=time.perf_counter(); atomic_checkpoint(cp,checkpoint_payload(cfg,rnd+1,states,graph,splits,records,diss,pstats,initial,rep_history,morph_nodes)); rec["checkpoint_seconds"]=time.perf_counter()-ct
         append_jsonl(out/"metrics.jsonl",rec)
         if STOP_SIGNAL is not None: return EXIT_REQUEUE
         previous_effective_connected=effective_connected
     final=graph_stats(graph); write_edges(out/"graph_final.edgelist",graph); atomic_json(out/"summary.json",summarize(cfg,records,started,pstats,initial,final,"partial_participation" if cfg.participation_rate<1 else "full_participation",cp)); success.write_text("SUCCESS\n",encoding="utf-8"); return 0
 
-def checkpoint_payload(cfg,next_round,states,graph,splits,records,diss,pstats,initial,rep_history=None):
+def checkpoint_payload(cfg,next_round,states,graph,splits,records,diss,pstats,initial,rep_history=None,morph_nodes=None):
     return {"format_version":2,"next_round":next_round,"client_states":states,"optimizer_states":None,"graph_type":type(graph).__name__,"graph":nx.node_link_data(graph),
       "data_split":splits,"metrics":records,"rng":rng_state(),"configuration":asdict(cfg),"experiment_id":config_hash(cfg),"active_client_sampler_state":random.getstate(),
-      "lfhe_state":{"update_mode":cfg.update_mode,"representation_history":rep_history or []},"baseline_state":[x.checkpoint() for x in diss],"partition_stats":pstats,"initial_graph_stats":initial}
+      "lfhe_state":{"update_mode":cfg.update_mode,"representation_history":rep_history or []},"baseline_state":[x.checkpoint() for x in diss],
+      "morph_state":morph_checkpoint(morph_nodes or []),"partition_stats":pstats,"initial_graph_stats":initial}
 
 
 
@@ -503,7 +578,7 @@ def parse_int_csv(value):
 def batch_parser():
     p=argparse.ArgumentParser(description="Run every LFHE workshop experiment from one command.")
     p.add_argument("--run-all",action="store_true",required=True)
-    p.add_argument("--suite",choices=("all","canonical","feasibility","primary","degree","partial"),default="all")
+    p.add_argument("--suite",choices=("all","paper","canonical","feasibility","primary","degree","partial"),default="all")
     p.add_argument("--results-root",default="./results/workshop_all")
     p.add_argument("--data-root",default=os.getenv("LFHE_DATA_ROOT","./data"))
     p.add_argument("--seeds",default="42,43,44",help="Seeds for scalable suites.")
@@ -526,30 +601,38 @@ def build_workshop_specs(a):
     seeds=parse_int_csv(a.seeds); canonical_seeds=parse_int_csv(a.canonical_seeds)
     primary_clients=parse_int_csv(a.primary_clients); degree_clients=parse_int_csv(a.degree_clients)
     partial_clients=parse_int_csv(a.partial_clients); specs=[]
-    selected={a.suite} if a.suite!="all" else {"canonical","feasibility","primary","degree","partial"}
+    selected={a.suite} if a.suite!="all" else {"paper","canonical","feasibility","primary","degree","partial"}
+    if "paper" in selected:
+        # Exact main-paper scalability protocol, plus Morph.
+        for n in (10,50,100,500):
+            for method in ("ring","static_random","epidemic","dissdl","morph","lfhe"):
+                for seed in canonical_seeds[:3]:
+                    specs.append(_spec(method,n,seed,"scalable",300,"paper_alignment",
+                        alpha=.3,dmax=str(max(2,int(2*math.log(n)))),initial_graph="canonical_er",
+                        topology_interval=5,eval_interval=5,eval_clients=n,final_eval_all=True,
+                        representation_mode="class_mean",lfhe_start_round=0))
     if "canonical" in selected:
-        # Morph is intentionally not faked here: add it once its implementation/API is supplied.
-        for method in ("ring","static_random","epidemic","dissdl","random_fof","lfhe"):
+        for method in ("ring","static_random","epidemic","dissdl","random_fof","morph","lfhe"):
             for seed in canonical_seeds: specs.append(_spec(method,30,seed,"canonical",300,"canonical"))
     if "feasibility" in selected:
         for n in (100,500,1000,1500,2000):
-            for method in ("static_random","lfhe"):
+            for method in ("static_random","morph","lfhe"):
                 specs.append(_spec(method,n,seeds[0],"scalable",5,"feasibility_full"))
         for n in partial_clients:
             for method in ("static_random","lfhe"):
                 specs.append(_spec(method,n,seeds[0],"scalable",5,"feasibility_partial",participation_rate=.1))
     if "primary" in selected:
         for n in primary_clients:
-            for method in ("static_random","random_fof","lfhe"):
+            for method in ("static_random","random_fof","morph","lfhe"):
                 for seed in seeds: specs.append(_spec(method,n,seed,"scalable",300,"primary"))
     if "degree" in selected:
         for n in degree_clients:
             for dmax in ("2","4","8","log2"):
-                for method in ("static_random","random_fof","lfhe"):
+                for method in ("static_random","random_fof","morph","lfhe"):
                     for seed in seeds: specs.append(_spec(method,n,seed,"scalable",300,"degree",dmax=dmax))
     if "partial" in selected:
         for n in partial_clients:
-            for method in ("static_random","lfhe"):
+            for method in ("static_random","morph","lfhe"):
                 for seed in seeds: specs.append(_spec(method,n,seed,"scalable",300,"partial",participation_rate=.1))
     return specs
 
@@ -560,13 +643,13 @@ def namespace_from_spec(spec,a):
     output=Path(a.results_root)/stage/spec["method"]/suffix
     # Construct the same argparse namespace expected by make_config.
     return argparse.Namespace(method=spec["method"],num_clients=spec["num_clients"],seed=spec["seed"],
-      rounds=spec["rounds"],protocol=spec["protocol"],alpha=.1,dmax=dmax,topology_interval=None,
-      eval_interval=None,initial_graph=None,participation_rate=participation,local_epochs=None,
-      local_steps=None,batch_size=None,lr=.05,output_dir=str(output),checkpoint_interval=10,
-      checkpoint_path="",resume=(output/"checkpoint.pt").exists(),force=a.force,eval_clients=50,
-      final_eval_all=True,data_root=a.data_root,update_mode="sequential",data_regime="fixed_total",
-      samples_per_client=None,link_failure_rate=0.,stale_view_rounds=0,repair_warning_fraction=.05,
-      min_samples_per_client=None,target_accuracy=.65,graph_metric_interval=25,dissdl_max_n=500,
+      rounds=spec["rounds"],protocol=spec["protocol"],alpha=spec.get("alpha",.1),dmax=dmax,topology_interval=spec.get("topology_interval"),
+      eval_interval=spec.get("eval_interval"),initial_graph=spec.get("initial_graph"),participation_rate=participation,local_epochs=spec.get("local_epochs"),
+      local_steps=spec.get("local_steps"),batch_size=spec.get("batch_size"),lr=spec.get("lr",.05),output_dir=str(output),checkpoint_interval=spec.get("checkpoint_interval",10),
+      checkpoint_path="",resume=(output/"checkpoint.pt").exists(),force=a.force,eval_clients=spec.get("eval_clients",50),
+      final_eval_all=spec.get("final_eval_all",True),data_root=a.data_root,update_mode=spec.get("update_mode","sequential"),data_regime=spec.get("data_regime","fixed_total"),
+      samples_per_client=spec.get("samples_per_client"),link_failure_rate=spec.get("link_failure_rate",0.),stale_view_rounds=spec.get("stale_view_rounds",0),repair_warning_fraction=.05,
+      min_samples_per_client=spec.get("min_samples_per_client"),representation_mode=spec.get("representation_mode","flatten"),lfhe_start_round=spec.get("lfhe_start_round",0),target_accuracy=.65,graph_metric_interval=25,dissdl_max_n=500,
       num_workers=0)
 
 
@@ -596,13 +679,13 @@ def run_all(a):
 
 def parser():
     p=argparse.ArgumentParser(description=__doc__); p.add_argument("--method",choices=METHODS,required=True); p.add_argument("--num-clients",type=int,required=True); p.add_argument("--seed",type=int,required=True)
-    p.add_argument("--rounds",type=int); p.add_argument("--protocol",choices=("canonical","scalable"),required=True); p.add_argument("--alpha",type=float,default=.1); p.add_argument("--dmax",default="4",choices=("2","4","8","log2")); p.add_argument("--topology-interval",type=int); p.add_argument("--eval-interval",type=int)
+    p.add_argument("--rounds",type=int); p.add_argument("--protocol",choices=("canonical","scalable"),required=True); p.add_argument("--alpha",type=float,default=.1); p.add_argument("--dmax",default="4",help="Positive integer degree cap or log2"); p.add_argument("--topology-interval",type=int); p.add_argument("--eval-interval",type=int)
     p.add_argument("--initial-graph",choices=("canonical_er","bounded_connected","clustered","disconnected_clusters")); p.add_argument("--participation-rate",type=float,default=1.); group=p.add_mutually_exclusive_group(); group.add_argument("--local-epochs",type=int); group.add_argument("--local-steps",type=int)
     p.add_argument("--batch-size",type=int); p.add_argument("--lr",type=float,default=.05); p.add_argument("--output-dir",required=True); p.add_argument("--checkpoint-interval",type=int,default=10); p.add_argument("--checkpoint-path",default=""); p.add_argument("--resume",action="store_true"); p.add_argument("--force",action="store_true")
     p.add_argument("--eval-clients",type=int,default=50); p.add_argument("--final-eval-all",dest="final_eval_all",action="store_true"); p.add_argument("--no-final-eval-all",dest="final_eval_all",action="store_false"); p.set_defaults(final_eval_all=True); p.add_argument("--data-root",default=os.getenv("LFHE_DATA_ROOT","./data")); p.add_argument("--update-mode",choices=("sequential","snapshot_concurrent"),default="sequential")
     p.add_argument("--data-regime",choices=("fixed_total","fixed_per_client"),default="fixed_total"); p.add_argument("--samples-per-client",type=int)
     p.add_argument("--link-failure-rate",type=float,default=0.); p.add_argument("--stale-view-rounds",type=int,default=0); p.add_argument("--repair-warning-fraction",type=float,default=.05)
-    p.add_argument("--min-samples-per-client",type=int); p.add_argument("--target-accuracy",type=float,default=.65); p.add_argument("--graph-metric-interval",type=int,default=25); p.add_argument("--dissdl-max-n",type=int,default=500); p.add_argument("--num-workers",type=int,default=0); return p
+    p.add_argument("--min-samples-per-client",type=int); p.add_argument("--representation-mode",choices=("flatten","class_mean"),default="flatten"); p.add_argument("--lfhe-start-round",type=int,default=0); p.add_argument("--target-accuracy",type=float,default=.65); p.add_argument("--graph-metric-interval",type=int,default=25); p.add_argument("--dissdl-max-n",type=int,default=500); p.add_argument("--num-workers",type=int,default=0); return p
 
 def make_config(a):
     canonical=a.protocol=="canonical"; rounds=a.rounds if a.rounds is not None else 300; topo=a.topology_interval if a.topology_interval is not None else 5; ev=a.eval_interval if a.eval_interval is not None else 5
@@ -610,16 +693,23 @@ def make_config(a):
     if epochs is None and steps is None: epochs=1
     batch=a.batch_size or 32; minimum=a.min_samples_per_client if a.min_samples_per_client is not None else (1 if canonical else max(1,min(10,50000//a.num_clients//2)))
     dmax=math.ceil(math.log2(a.num_clients)) if a.dmax=="log2" else int(a.dmax)
+    if dmax<2: raise ValueError("dmax must be >=2")
     if not 0<a.participation_rate<=1: raise ValueError("participation-rate must be in (0,1]")
     if not 0<=a.link_failure_rate<1: raise ValueError("link-failure-rate must be in [0,1)")
     if a.stale_view_rounds<0: raise ValueError("stale-view-rounds must be >=0")
+    if a.lfhe_start_round<0: raise ValueError("lfhe-start-round must be >=0")
     if a.data_regime=="fixed_per_client" and (a.samples_per_client is None or a.samples_per_client<1): raise ValueError("fixed_per_client requires --samples-per-client")
     if a.samples_per_client is not None and a.samples_per_client*a.num_clients>50000: raise ValueError("requested fixed-per-client data exceeds CIFAR-10 training set")
     if canonical and a.participation_rate!=1: raise ValueError("canonical protocol requires full participation")
+    if canonical:
+        a.representation_mode="flatten"
+        a.lfhe_start_round=21
     if canonical and (a.dmax!="4" or initial!="canonical_er" or topo!=5 or ev!=5 or batch!=32 or epochs!=1 or steps is not None or a.update_mode!="sequential" or a.data_regime!="fixed_total" or a.link_failure_rate!=0 or a.stale_view_rounds!=0): raise ValueError("canonical protocol requires D_max=4, canonical_er, sequential/full/fixed-total, no failures/staleness, intervals=5, batch=32, and one local epoch")
+    if a.method=="morph" and MorphNode is None:
+        raise ValueError(f"Morph requires morph.py exposing MorphNode: {MORPH_IMPORT_ERROR}")
     if a.method=="dissdl" and a.num_clients>a.dissdl_max_n: raise ValueError("DissDL disabled above --dissdl-max-n due to its all-client known-peer directory")
     if a.method=="fedavg" and initial=="bounded_connected": initial="canonical_er"
-    return Config(a.method,a.num_clients,a.seed,rounds,a.protocol,a.alpha,a.dmax,dmax,topo,ev,initial,a.participation_rate,epochs,steps,batch,a.lr,a.output_dir,a.checkpoint_interval,a.checkpoint_path,a.resume,a.force,a.eval_clients,a.final_eval_all,a.data_root,a.update_mode,minimum,a.target_accuracy,a.graph_metric_interval,a.dissdl_max_n,a.num_workers,a.samples_per_client,a.link_failure_rate,a.stale_view_rounds,a.repair_warning_fraction,data_regime=a.data_regime)
+    return Config(a.method,a.num_clients,a.seed,rounds,a.protocol,a.alpha,a.dmax,dmax,topo,ev,initial,a.participation_rate,epochs,steps,batch,a.lr,a.output_dir,a.checkpoint_interval,a.checkpoint_path,a.resume,a.force,a.eval_clients,a.final_eval_all,a.data_root,a.update_mode,minimum,a.target_accuracy,a.graph_metric_interval,a.dissdl_max_n,a.num_workers,a.samples_per_client,a.link_failure_rate,a.stale_view_rounds,a.repair_warning_fraction,a.representation_mode,a.lfhe_start_round,data_regime=a.data_regime)
 
 def main():
     try:
