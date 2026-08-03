@@ -1,10 +1,12 @@
-import csv,random
+import ast,csv,inspect,random
 from pathlib import Path
 import networkx as nx
 import numpy as np
 import torch
 import main
 import main_paper_exact as paper
+from dissdl import DissDLNode
+from epidemic import directed_aggregation
 
 ROOT=Path(__file__).resolve().parents[1]
 
@@ -23,6 +25,30 @@ def test_paper_er_is_deterministic_and_matched():
 def test_paper_epidemic_and_dissdl_degrees():
     assert set(dict(paper.build_epidemic_graph(20,4,42).out_degree()).values())=={4}
     random.seed(42); assert set(map(len,paper.dissdl_initial(20,3).values()))=={3}
+
+def test_paper_imports_historical_baselines_without_substitutes():
+    assert paper.DissDLNode is DissDLNode
+    assert paper.directed_aggregation is directed_aggregation
+    assert not hasattr(paper,'HistoricalDissDLNode')
+    assert not hasattr(paper,'directed_average')
+
+def test_paper_set_seed_does_not_change_cudnn_flags(monkeypatch):
+    monkeypatch.setattr(torch.backends.cudnn,'deterministic',False)
+    monkeypatch.setattr(torch.backends.cudnn,'benchmark',True)
+    paper.set_seed(42)
+    assert torch.backends.cudnn.deterministic is False
+    assert torch.backends.cudnn.benchmark is True
+    source=inspect.getsource(paper.set_seed)
+    assert 'cudnn' not in source
+
+def test_paper_epidemic_fixed_s_and_dissdl_historical_parameters():
+    source=inspect.getsource(paper.run)
+    tree=ast.parse(source)
+    epidemic_calls=[n for n in ast.walk(tree) if isinstance(n,ast.Call) and getattr(n.func,'id',None)=='build_epidemic_graph']
+    assert epidemic_calls and all(next(k.value for k in n.keywords if k.arg=='s').value==4 for n in epidemic_calls)
+    model=torch.nn.Linear(2,2); node=paper.DissDLNode(node_id=0,model=model,neighbors=[1,2,3],beta=1.0)
+    assert node.beta==1.0 and len(node.wanted_senders)==3
+    assert 'beta=1.0' in source
 def test_bounded_connected_v2_headroom_and_determinism():
     a=main.bounded_connected(100,4,42); b=main.bounded_connected(100,4,42)
     rng=random.Random(42); order=list(range(100)); rng.shuffle(order); old=nx.Graph(); old.add_nodes_from(range(100))

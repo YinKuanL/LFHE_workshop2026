@@ -9,7 +9,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
-from epidemic import build_epidemic_graph
+from dissdl import DissDLNode
+from epidemic import build_epidemic_graph, directed_aggregation
 from lfhe import lfhe_update
 from morph import MorphNode
 
@@ -31,14 +32,13 @@ class CNN(nn.Module):
 def set_seed(seed):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic=True; torch.backends.cudnn.benchmark=False
 
 def load_dataset(root):
     from torchvision import datasets,transforms
     norm=transforms.Normalize([.4914,.4822,.4465],[.2023,.1994,.2010])
     train_tf=transforms.Compose([transforms.RandomCrop(32,padding=4),transforms.RandomHorizontalFlip(),transforms.ToTensor(),norm])
     test_tf=transforms.Compose([transforms.ToTensor(),norm])
-    return datasets.CIFAR10(root,train=True,download=False,transform=train_tf),datasets.CIFAR10(root,train=False,download=False,transform=test_tf)
+    return datasets.CIFAR10(root,train=True,download=True,transform=train_tf),datasets.CIFAR10(root,train=False,download=True,transform=test_tf)
 
 def dirichlet_split(labels,num_clients,alpha,seed):
     np.random.seed(seed); result=[[] for _ in range(num_clients)]
@@ -84,23 +84,6 @@ def average_models(clients,graph):
         values.append((1-total,client.model.state_dict())); updates.append({k:sum(w*s[k] for w,s in values) for k in values[0][1]})
     for client,state in zip(clients,updates): client.model.load_state_dict(state)
 
-def directed_average(clients,graph):
-    updates=[]
-    for i,client in enumerate(clients):
-        incoming=list(graph.predecessors(i)); states=[clients[j].model.state_dict() for j in incoming]+[client.model.state_dict()]
-        updates.append({k:sum(s[k] for s in states)/len(states) for k in states[0]})
-    for client,state in zip(clients,updates): client.model.load_state_dict(state)
-
-class HistoricalDissDLNode:
-    def __init__(self,node_id,model,neighbors):
-        self.id=node_id; self.model=model; self.wanted_senders=set(neighbors); self.known_peers=set(); self.received_models={}
-    def aggregate(self):
-        models=[self.model]+[self.received_models[i] for i in self.wanted_senders if i in self.received_models]
-        states=[m.state_dict() for m in models]; self.model.load_state_dict({k:sum(s[k] for s in states)/len(states) for k in states[0]})
-    def update_wanted_senders(self):
-        candidates=sorted(self.known_peers-self.wanted_senders-{self.id})
-        if candidates and self.wanted_senders: self.wanted_senders.remove(random.choice(sorted(self.wanted_senders))); self.wanted_senders.add(random.choice(candidates))
-
 def morph_nodes(clients,seed,degree=4):
     rng=random.Random(seed); nodes=[]
     for i,c in enumerate(clients):
@@ -141,7 +124,7 @@ def run(args):
     else: graph=None
     diss=[]
     if args.method=="dissdl":
-        diss=[HistoricalDissDLNode(i,clients[i].model,graph[i]) for i in range(args.num_clients)]
+        diss=[DissDLNode(node_id=i,model=clients[i].model,neighbors=list(graph[i]),beta=1.0) for i in range(args.num_clients)]
         for n in diss: n.known_peers=set(range(args.num_clients))-{n.id}
         initial_graph=nx.DiGraph((s,i) for i,senders in graph.items() for s in senders)
     elif args.method=="morph": nodes=morph_nodes(clients,args.seed); initial_graph=morph_graph(nodes); graph=initial_graph
@@ -151,7 +134,7 @@ def run(args):
     atomic_json(out/"config.json",config); records=[]; started=time.time()
     for rnd in range(args.rounds):
         for c in clients: c.train(1)
-        if args.method=="epidemic": graph=build_epidemic_graph(args.num_clients,s=4,seed=args.seed+rnd); directed_average(clients,graph)
+        if args.method=="epidemic": graph=build_epidemic_graph(args.num_clients,s=4,seed=args.seed+rnd); directed_aggregation(clients,graph)
         elif args.method=="dissdl":
             for node in diss: node.received_models={i:copy.deepcopy(clients[i].model) for i in node.wanted_senders}
             for node in diss:
@@ -163,8 +146,8 @@ def run(args):
             average_models(clients,graph)
             if args.method=="lfhe" and rnd%5==0: graph=lfhe_update(graph,clients,.05,compute_dmax(args.num_clients),1.,1.,.1,rnd)
         rec={"round":rnd}
-        if rnd%5==0 or rnd==args.rounds-1:
-            values=[c.evaluate(loader) for c in clients]; params=torch.stack([torch.cat([p.data.flatten().cpu() for p in c.model.parameters()]) for c in clients]); mean=params.mean(0)
+        if rnd%5==0:
+            values=[c.evaluate(loader) for c in clients]; params=torch.stack([torch.cat([p.data.view(-1) for p in c.model.parameters()]) for c in clients]); mean=params.mean(0)
             rec.update(mean_accuracy=float(np.mean([x[0] for x in values])),mean_loss=float(np.mean([x[1] for x in values])),inter_node_variance=float(((params-mean).norm(dim=1)**2).mean()),evaluated_clients=len(clients))
         records.append(rec)
         with (out/"metrics.jsonl").open("a",encoding="utf-8") as f: f.write(json.dumps(rec)+"\n")
