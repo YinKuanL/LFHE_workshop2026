@@ -127,10 +127,35 @@ def bounded_connected(n,dmax,seed):
     rng=random.Random(seed); order=list(range(n)); rng.shuffle(order); g=nx.Graph(); g.add_nodes_from(range(n))
     for i,u in enumerate(order): g.add_edge(u,order[(i+1)%n])
     pairs=[(u,v) for u in range(n) for v in range(u+1,n)]; rng.shuffle(pairs)
+    target_average_degree=min(3.0,dmax-1)
+    target_edges=round(n*target_average_degree/2)
     for u,v in pairs:
+        if g.number_of_edges()>=target_edges: break
         if g.degree(u)<dmax and g.degree(v)<dmax and not g.has_edge(u,v): g.add_edge(u,v)
     assert nx.is_connected(g) and max(dict(g.degree()).values())<=dmax
+    if sum(dmax-d for _,d in g.degree())<=0: raise RuntimeError("bounded_connected has no degree headroom")
     return g
+
+def adaptive_topology_preflight(graph,dmax):
+    degrees=[d for _,d in graph.degree()]
+    histogram={str(d):degrees.count(d) for d in sorted(set(degrees))}
+    fof=sum(1 for i in graph for j in graph.neighbors(i) for k in graph.neighbors(j)
+            if k!=i and not graph.has_edge(i,k) and graph.degree(k)<dmax)
+    result={"initial_degree_histogram":histogram,
+            "initial_available_degree_slots":sum(max(0,dmax-d) for d in degrees),
+            "initial_fraction_nodes_below_cap":sum(d<dmax for d in degrees)/len(degrees),
+            "initial_fof_candidate_count":fof}
+    if result["initial_available_degree_slots"]<=0 or fof<=0:
+        raise RuntimeError("adaptive topology cannot rewire: no endpoint headroom or FoF candidates")
+    return result
+
+def checkpoint_policy(cfg):
+    if cfg.method=="morph" and cfg.num_clients>=500:
+        return "disabled","Morph N>=500 checkpoints duplicate persistent peer_models and exceed memory/quota",False
+    return "full",None,True
+
+def should_checkpoint(cfg,round_complete,stop_signal=False,final_round=False):
+    return checkpoint_policy(cfg)[2] and (round_complete%cfg.checkpoint_interval==0 or stop_signal or final_round)
 
 def clustered_hard(n,dmax,seed,connected=True):
     """Two dense-ish ring communities; one bridge when connected."""
@@ -427,20 +452,21 @@ def summarize(cfg, records, started, pstats, initial, final, deployment, checkpo
     projection_records=records[:-1] if len(records)>1 else records
     mean_round=float(np.mean([r["total_round_seconds"] for r in projection_records])) if projection_records else None
     peak_rss=max((r.get("peak_cpu_rss_bytes") or 0 for r in records),default=0); peak_gpu=max((r.get("peak_gpu_reserved_bytes") or 0 for r in records),default=0)
-    checkpoint_bytes=checkpoint_path.stat().st_size if checkpoint_path and checkpoint_path.exists() else None
+    policy,disabled_reason,resumable=checkpoint_policy(cfg)
+    checkpoint_bytes=checkpoint_path.stat().st_size if resumable and checkpoint_path and checkpoint_path.exists() else None
     checkpoint_seconds=max((r.get("checkpoint_seconds",0) for r in records),default=0); final_eval=evals[-1].get("evaluation_seconds") if evals else None
     projected=mean_round*300 if mean_round is not None else None
     gpu_total=torch.cuda.get_device_properties(0).total_memory if torch.cuda.is_available() else None
     gate_checks={"projected_300_round_seconds_le_48h":projected is not None and projected<=48*3600,
       "peak_cpu_rss_le_22_4_gib":peak_rss<=22.4*1024**3,"peak_gpu_reserved_le_90_percent":gpu_total is None or peak_gpu<=.9*gpu_total,
-      "checkpoint_le_10_gib":checkpoint_bytes is not None and checkpoint_bytes<=10*1024**3,"checkpoint_time_le_600s":checkpoint_seconds<=600,
+      "checkpoint_le_10_gib":not resumable or (checkpoint_bytes is not None and checkpoint_bytes<=10*1024**3),"checkpoint_time_le_600s":checkpoint_seconds<=600,
       "full_evaluation_time_le_3h":final_eval is not None and final_eval<=3*3600,"repair_fraction_le_threshold":pstats.get("repaired_sample_fraction",0)<=cfg.repair_warning_fraction,
       "no_nan_or_inf":all(r.get("model_parameters_finite",True) and all(not isinstance(v,float) or math.isfinite(v) for v in r.values()) for r in records)}
     return {"experiment_id":config_hash(cfg),"status":"complete","protocol":cfg.protocol,"deployment_protocol":deployment,
       "final_accuracy":ys[-1] if ys else None,"normalized_auc":auc,"rounds_to_target":reached["round"] if reached else None,
       "bytes_to_target":reached["cumulative_bytes"] if reached else None,"wall_clock_time_to_target":reached["elapsed_seconds"] if reached else None,
       "partition":pstats,"initial_graph":initial,"final_graph":final,"wall_clock_seconds":time.time()-started,
-      "evaluations":len(evals),"rounds_completed":cfg.rounds,"last_accepted_rewire_round":accepted[-1] if accepted else None,
+      "evaluations":len(evals),"rounds_completed":cfg.rounds,"checkpoint_policy":policy,"checkpoint_disabled_reason":disabled_reason,"resumable":resumable,"last_accepted_rewire_round":accepted[-1] if accepted else None,
       "topology_stabilization_round":(accepted[-1]+1) if accepted else 0,
       "resource_projection":{"mean_round_seconds":mean_round,"projected_300_round_seconds":projected,"peak_cpu_rss_bytes":peak_rss,"peak_gpu_reserved_bytes":peak_gpu,"checkpoint_bytes":checkpoint_bytes,"max_checkpoint_seconds":checkpoint_seconds,"final_full_evaluation_seconds":final_eval},
       "feasibility_gate":{"passed":all(gate_checks.values()),"checks":gate_checks},
@@ -455,6 +481,8 @@ def run(cfg):
             if path.exists(): path.unlink()
     if out.exists() and any(out.iterdir()) and not cfg.resume and not cfg.force: raise ValueError("output-dir is non-empty; use --resume, --force, or a unique path")
     out.mkdir(parents=True,exist_ok=True); cp=Path(cfg.checkpoint_path) if cfg.checkpoint_path else out/"checkpoint.pt"
+    policy,checkpoint_disabled_reason,resumable=checkpoint_policy(cfg)
+    if cfg.resume and not resumable: raise ValueError(f"resume unavailable: {checkpoint_disabled_reason}")
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu"); started=time.time(); train,test=load_cifar(cfg.data_root); labels=np.asarray(train.targets)
     test_loader=DataLoader(test,batch_size=256,shuffle=False,num_workers=cfg.num_workers,pin_memory=device.type=="cuda")
     if cfg.resume and cp.exists():
@@ -480,6 +508,8 @@ def run(cfg):
                 graph=directed
         if cfg.method=="morph": morph_nodes=make_morph_nodes(states,graph,cfg)
         initial=graph_stats(graph); initial["over_cap_nodes"]=sum(d>cfg.dmax for _,d in graph.degree())
+        if cfg.protocol=="scalable" and cfg.method in ("lfhe","random_fof"):
+            initial.update(adaptive_topology_preflight(graph,cfg.dmax))
         representation_shape=list(states[0]["classifier.4.weight"].shape)
         representation_dimension=(representation_shape[0] if cfg.representation_mode=="class_mean" else int(states[0]["classifier.4.weight"].numel()))
         resolved_initial="dissdl_random_in_degree_3" if cfg.protocol=="canonical" and cfg.method=="dissdl" else "epidemic_directed_degree_4" if cfg.protocol=="canonical" and cfg.method=="epidemic" else cfg.initial_graph
@@ -502,6 +532,8 @@ def run(cfg):
         for i in active: states[i]=train_client(working,states[i],train,splits[i],cfg,device,cfg.seed*1_000_003+rnd*cfg.num_clients+i)
         train_s=time.perf_counter()-t
         if STOP_SIGNAL is not None:
+            if not resumable:
+                print(f"non-resumable termination: {checkpoint_disabled_reason}",file=sys.stderr,flush=True); return 3
             payload=checkpoint_payload(cfg,rnd,states,graph,splits,records,diss,pstats,initial,rep_history,morph_nodes); atomic_checkpoint(cp,payload); return EXIT_REQUEUE
         t=time.perf_counter()
         aggregation_graph,dropped_links=failed_link_view(graph,cfg.link_failure_rate,cfg.seed*10_000_019+rnd)
@@ -545,7 +577,7 @@ def run(cfg):
         except ImportError: rec["peak_cpu_rss_bytes"]=None
         rec["peak_gpu_allocated_bytes"]=torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0; rec["peak_gpu_reserved_bytes"]=torch.cuda.max_memory_reserved() if torch.cuda.is_available() else 0
         records.append(rec)
-        if (rnd+1)%cfg.checkpoint_interval==0 or STOP_SIGNAL is not None or rnd==cfg.rounds-1:
+        if should_checkpoint(cfg,rnd+1,STOP_SIGNAL is not None,rnd==cfg.rounds-1):
             ct=time.perf_counter(); atomic_checkpoint(cp,checkpoint_payload(cfg,rnd+1,states,graph,splits,records,diss,pstats,initial,rep_history,morph_nodes)); rec["checkpoint_seconds"]=time.perf_counter()-ct
         append_jsonl(out/"metrics.jsonl",rec)
         if STOP_SIGNAL is not None: return EXIT_REQUEUE
