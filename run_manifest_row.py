@@ -12,21 +12,22 @@ def main():
     r=rows[args.index]; out=Path(r["output_dir"]); out.mkdir(parents=True,exist_ok=True)
     if (out/"SUCCESS").exists():
         print(f"[skip] {out}/SUCCESS exists",flush=True); return 0
-    cmd=[sys.executable,args.main,"--method",r["method"],"--num-clients",r["num_clients"],
-         "--seed",r["seed"],"--rounds",r["rounds"],"--protocol",r["protocol"],
-         "--alpha",r["alpha"],"--dmax",r["dmax"],"--topology-interval",r["topology_interval"],
-         "--eval-interval",r["eval_interval"],"--initial-graph",r["initial_graph"],
-         "--participation-rate",r["participation_rate"],"--local-epochs",r["local_epochs"],
-         "--batch-size",r["batch_size"],"--checkpoint-interval",r["checkpoint_interval"],
-         "--eval-clients",r["eval_clients"],"--update-mode",r["update_mode"],
-         "--data-regime",r["data_regime"],"--link-failure-rate",r["link_failure_rate"],
-         "--stale-view-rounds",r["stale_view_rounds"],"--representation-mode",r["representation_mode"],
-         "--lfhe-start-round",r["lfhe_start_round"],"--output-dir",str(out),"--data-root",args.data_root]
+    cmd=[sys.executable,args.main,"--output-dir",str(out),"--data-root",args.data_root]
+    fields={"method":"--method","num_clients":"--num-clients","seed":"--seed","rounds":"--rounds",
+      "protocol":"--protocol","alpha":"--alpha","dmax":"--dmax","degree_regime":"--degree-regime",
+      "topology_interval":"--topology-interval","eval_interval":"--eval-interval","initial_graph":"--initial-graph",
+      "participation_rate":"--participation-rate","local_epochs":"--local-epochs","batch_size":"--batch-size",
+      "lr":"--lr","checkpoint_interval":"--checkpoint-interval","checkpoint_policy":"--checkpoint-policy",
+      "eval_clients":"--eval-clients","update_mode":"--update-mode","data_regime":"--data-regime",
+      "link_failure_rate":"--link-failure-rate","stale_view_rounds":"--stale-view-rounds",
+      "representation_mode":"--representation-mode","lfhe_start_round":"--lfhe-start-round"}
+    for key,flag in fields.items():
+        if r.get(key,"")!="": cmd += [flag,r[key]]
     if r["final_eval_all"].lower()=="true": cmd.append("--final-eval-all")
     else: cmd.append("--no-final-eval-all")
     if r["samples_per_client"]: cmd += ["--samples-per-client",r["samples_per_client"]]
     if r["min_samples_per_client"]: cmd += ["--min-samples-per-client",r["min_samples_per_client"]]
-    if (out/"checkpoint.pt").exists(): cmd.append("--resume")
+    if r.get("checkpoint_policy","auto")!="disabled" and (out/"checkpoint.pt").exists(): cmd.append("--resume")
     print("[exec]"," ".join(cmd),flush=True)
     return subprocess.call(cmd)
 if __name__=="__main__": raise SystemExit(main())

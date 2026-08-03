@@ -57,6 +57,7 @@ class Config:
     repair_warning_fraction:float; representation_mode:str; lfhe_start_round:int
     w1:float=1.; w2:float=1.; w3:float=.1; epsilon:float=.05
     dataset:str="cifar10"; data_regime:str="fixed_total"; optimizer:str="SGD"
+    degree_regime:str="ordinary"; checkpoint_policy_override:str="auto"
 
 def set_seed(seed):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
@@ -136,7 +137,7 @@ def bounded_connected(n,dmax,seed):
     if sum(dmax-d for _,d in g.degree())<=0: raise RuntimeError("bounded_connected has no degree headroom")
     return g
 
-def adaptive_topology_preflight(graph,dmax):
+def adaptive_topology_preflight(graph,dmax,fail=True):
     degrees=[d for _,d in graph.degree()]
     histogram={str(d):degrees.count(d) for d in sorted(set(degrees))}
     fof=sum(1 for i in graph for j in graph.neighbors(i) for k in graph.neighbors(j)
@@ -145,11 +146,16 @@ def adaptive_topology_preflight(graph,dmax):
             "initial_available_degree_slots":sum(max(0,dmax-d) for d in degrees),
             "initial_fraction_nodes_below_cap":sum(d<dmax for d in degrees)/len(degrees),
             "initial_fof_candidate_count":fof}
-    if result["initial_available_degree_slots"]<=0 or fof<=0:
+    result["structurally_rewirable"]=result["initial_available_degree_slots"]>0 and fof>0
+    if fail and not result["structurally_rewirable"]:
         raise RuntimeError("adaptive topology cannot rewire: no endpoint headroom or FoF candidates")
     return result
 
 def checkpoint_policy(cfg):
+    if cfg.checkpoint_policy_override=="disabled":
+        return "disabled","disabled by experiment manifest",False
+    if cfg.checkpoint_policy_override=="full":
+        return "full",None,True
     if cfg.method=="morph" and cfg.num_clients>=500:
         return "disabled","Morph N>=500 checkpoints duplicate persistent peer_models and exceed memory/quota",False
     return "full",None,True
@@ -165,10 +171,11 @@ def clustered_hard(n,dmax,seed,connected=True):
         g.remove_edge(0,cut-1); g.remove_edge(cut,n-1); g.add_edge(0,cut); g.add_edge(cut-1,n-1)
     if dmax>2:
         rng=random.Random(seed); groups=[list(range(cut)),list(range(cut,n))]
-        for group in groups:
-            pairs=[(u,v) for u in group for v in group if u<v]; rng.shuffle(pairs)
-            for u,v in pairs:
-                if g.degree(u)<dmax and g.degree(v)<dmax and not g.has_edge(u,v): g.add_edge(u,v)
+        pairs=[(u,v) for group in groups for u in group for v in group if u<v]; rng.shuffle(pairs)
+        target_edges=round(n*min(3.0,dmax-1)/2)
+        for u,v in pairs:
+            if g.number_of_edges()>=target_edges: break
+            if g.degree(u)<dmax and g.degree(v)<dmax and not g.has_edge(u,v): g.add_edge(u,v)
     return g
 
 def initial_graph(cfg):
@@ -188,6 +195,7 @@ def initial_graph(cfg):
             graph.add_edges_from((j,i) for j in rng.sample(peers,min(3,len(peers))))
         return graph
     if cfg.initial_graph=="canonical_er": return canonical_er(cfg.num_clients,cfg.seed)
+    if cfg.initial_graph=="ring": return nx.cycle_graph(cfg.num_clients)
     if cfg.initial_graph=="clustered": return clustered_hard(cfg.num_clients,cfg.dmax,cfg.seed,True)
     if cfg.initial_graph=="disconnected_clusters": return clustered_hard(cfg.num_clients,cfg.dmax,cfg.seed,False)
     return bounded_connected(cfg.num_clients,cfg.dmax,cfg.seed)
@@ -195,6 +203,7 @@ def initial_graph(cfg):
 def graph_stats(g, expensive=True):
     und=g.to_undirected(); deg=[d for _,d in und.degree()]; comps=nx.number_connected_components(und)
     out={"edges":g.number_of_edges(),"mean_degree":float(np.mean(deg)),"min_degree":min(deg),"max_degree":max(deg),
+         "degree_histogram":{str(d):deg.count(d) for d in sorted(set(deg))},
          "connected_components":comps,"clustering_coefficient":float(nx.average_clustering(und))}
     if comps==1:
         if len(g)<=300 and expensive: out["diameter"]=nx.diameter(und); out["effective_path_length"]=nx.average_shortest_path_length(und)
@@ -350,7 +359,8 @@ def snapshot_concurrent_lfhe(graph, clients, active, cfg, round_index):
         added=edges(proposed)-edges(snapshot); removed=edges(snapshot)-edges(proposed)
         if added or removed: proposals.append((i,added,removed,event))
         trace.append(event)
-    committed=snapshot.copy(); touched=set(); conflicts=stale_rejections=degree_rejections=0
+    committed=snapshot.copy(); touched=set(); conflicts=stale_rejections=degree_rejections=connectivity_rejections=0
+    preserve_connectivity=nx.is_connected(snapshot.to_undirected())
     for i,added,removed,event in proposals:
         endpoints={x for edge in added|removed for x in edge}
         if endpoints&touched:
@@ -361,11 +371,19 @@ def snapshot_concurrent_lfhe(graph, clients, active, cfg, round_index):
         candidate.remove_edges_from(removed); candidate.add_edges_from(added)
         if max(dict(candidate.degree()).values())>cfg.dmax:
             degree_rejections+=1; event["action"]="rejected_degree_safety"; continue
+        if preserve_connectivity and not nx.is_connected(candidate.to_undirected()):
+            connectivity_rejections+=1; event["action"]="rejected_connectivity_safety"; continue
         committed=candidate; touched.update(endpoints); event["action"]="committed_"+event["action"]
-    stats={"proposal_count":len(proposals),"shared_endpoint_conflicts":conflicts,
+    stats={"proposal_count":len(proposals),"proposals_generated":len(proposals),
+           "accepted_proposals":len(proposals)-conflicts-stale_rejections-degree_rejections-connectivity_rejections,
+           "rejected_proposals_concurrent":conflicts+stale_rejections+degree_rejections+connectivity_rejections,
+           "endpoint_conflicts":conflicts,"degree_conflicts":degree_rejections,
+           "stale_proposal_rejections":stale_rejections,"connectivity_safeguard_rejections":connectivity_rejections,
+           "temporary_degree_violations":degree_rejections,"final_degree_violations":sum(d>cfg.dmax for _,d in committed.degree()),
+           "shared_endpoint_conflicts":conflicts,
            "shared_endpoint_conflict_rate":conflicts/max(1,len(proposals)),
            "stale_rejections":stale_rejections,"degree_safety_rejections":degree_rejections,
-           "committed_proposals":len(proposals)-conflicts-stale_rejections-degree_rejections}
+           "committed_proposals":len(proposals)-conflicts-stale_rejections-degree_rejections-connectivity_rejections}
     return committed,trace,stats
 
 def dissdl_aggregate(states, nodes, active):
@@ -494,9 +512,10 @@ def run(cfg):
         pstats=saved["partition_stats"]; initial=saved["initial_graph_stats"]
         morph_nodes=restore_morph_nodes(states,graph,cfg,saved.get("morph_state",[])) if cfg.method=="morph" else []
     else:
-        samples=cfg.samples_per_client if cfg.data_regime=="fixed_per_client" else None
+        samples=cfg.samples_per_client if cfg.data_regime in ("fixed_per_client","fixed_samples_per_client") else None
         splits,split_meta=dirichlet_split(labels,cfg.num_clients,cfg.alpha,cfg.min_samples_per_client,cfg.seed,cfg.protocol=="canonical",return_stats=True,samples_per_client=samples)
         pstats={**partition_stats(labels,splits),**split_meta}; pstats["repair_warning"]=pstats["repaired_sample_fraction"]>cfg.repair_warning_fraction
+        pstats["total_used_samples"]=sum(map(len,splits)); pstats["unused_samples"]=len(labels)-pstats["total_used_samples"]
         states=initial_states(cfg.num_clients,cfg.seed); graph=initial_graph(cfg); start=0; records=[]; rep_history=[]
         diss=[]; morph_nodes=[]
         if cfg.method=="dissdl":
@@ -509,7 +528,7 @@ def run(cfg):
         if cfg.method=="morph": morph_nodes=make_morph_nodes(states,graph,cfg)
         initial=graph_stats(graph); initial["over_cap_nodes"]=sum(d>cfg.dmax for _,d in graph.degree())
         if cfg.protocol=="scalable" and cfg.method in ("lfhe","random_fof"):
-            initial.update(adaptive_topology_preflight(graph,cfg.dmax))
+            initial.update(adaptive_topology_preflight(graph,cfg.dmax,fail=cfg.degree_regime!="fixed2"))
         representation_shape=list(states[0]["classifier.4.weight"].shape)
         representation_dimension=(representation_shape[0] if cfg.representation_mode=="class_mean" else int(states[0]["classifier.4.weight"].numel()))
         resolved_initial="dissdl_random_in_degree_3" if cfg.protocol=="canonical" and cfg.method=="dissdl" else "epidemic_directed_degree_4" if cfg.protocol=="canonical" and cfg.method=="epidemic" else cfg.initial_graph
@@ -542,7 +561,7 @@ def run(cfg):
         elif cfg.method=="dissdl": tx=dissdl_aggregate(states,diss,active)
         elif cfg.method=="morph": graph,tx=morph_round(states,morph_nodes,active,rnd); aggregation_graph=graph
         else: tx=aggregate(states,aggregation_graph,active)
-        agg_s=time.perf_counter()-t; topo_s=0.; trace=[]; concurrency={"proposal_count":0,"shared_endpoint_conflicts":0,"shared_endpoint_conflict_rate":0.,"stale_rejections":0,"degree_safety_rejections":0,"committed_proposals":0}
+        agg_s=time.perf_counter()-t; topo_s=0.; trace=[]; concurrency={"proposal_count":0,"proposals_generated":0,"accepted_proposals":0,"rejected_proposals_concurrent":0,"endpoint_conflicts":0,"degree_conflicts":0,"stale_proposal_rejections":0,"connectivity_safeguard_rejections":0,"temporary_degree_violations":0,"final_degree_violations":0,"shared_endpoint_conflicts":0,"shared_endpoint_conflict_rate":0.,"stale_rejections":0,"degree_safety_rejections":0,"committed_proposals":0}
         current_reps=torch.stack([s["classifier.4.weight"].clone() for s in states]); rep_history.append((rnd,current_reps)); rep_history=rep_history[-max(1,cfg.stale_view_rounds+1):]
         lfhe_window=(cfg.method!="lfhe" or rnd>=cfg.lfhe_start_round)
         if cfg.method!="morph" and rnd%cfg.topology_interval==0 and lfhe_window:
@@ -570,7 +589,7 @@ def run(cfg):
         if rnd%cfg.graph_metric_interval==0 or rnd==cfg.rounds-1: rec["graph"]=graph_stats(graph,True)
         if rnd%cfg.eval_interval==0 or rnd==cfg.rounds-1:
             et=time.perf_counter(); ids=list(range(cfg.num_clients)) if (cfg.protocol=="canonical" or (cfg.final_eval_all and rnd==cfg.rounds-1)) else fixed_eval
-            acc,loss=evaluate(working,states,ids,test_loader,device); rec.update({"mean_accuracy":float(np.mean(acc)),"std_accuracy":float(np.std(acc)),"min_accuracy":min(acc),"max_accuracy":max(acc),"mean_loss":float(np.mean(loss)),"evaluated_clients":len(ids),"evaluation_seconds":time.perf_counter()-et}); rec.update(model_metrics(states)); rec["model_parameters_finite"]=all(torch.isfinite(v).all().item() for state in states for v in state.values() if v.is_floating_point())
+            acc,loss=evaluate(working,states,ids,test_loader,device); rec.update({"mean_accuracy":float(np.mean(acc)),"accuracy_variance":float(np.var(acc)),"std_accuracy":float(np.std(acc)),"min_accuracy":min(acc),"max_accuracy":max(acc),"mean_loss":float(np.mean(loss)),"evaluated_clients":len(ids),"evaluation_seconds":time.perf_counter()-et}); rec.update(model_metrics(states)); rec["model_parameters_finite"]=all(torch.isfinite(v).all().item() for state in states for v in state.values() if v.is_floating_point())
         rec["total_round_seconds"]=time.perf_counter()-rt; rec["elapsed_seconds"]=time.time()-started
         try:
             import psutil; rec["peak_cpu_rss_bytes"]=psutil.Process().memory_info().rss
@@ -712,10 +731,12 @@ def run_all(a):
 def parser():
     p=argparse.ArgumentParser(description=__doc__); p.add_argument("--method",choices=METHODS,required=True); p.add_argument("--num-clients",type=int,required=True); p.add_argument("--seed",type=int,required=True)
     p.add_argument("--rounds",type=int); p.add_argument("--protocol",choices=("canonical","scalable"),required=True); p.add_argument("--alpha",type=float,default=.1); p.add_argument("--dmax",default="4",help="Positive integer degree cap or log2"); p.add_argument("--topology-interval",type=int); p.add_argument("--eval-interval",type=int)
-    p.add_argument("--initial-graph",choices=("canonical_er","bounded_connected","clustered","disconnected_clusters")); p.add_argument("--participation-rate",type=float,default=1.); group=p.add_mutually_exclusive_group(); group.add_argument("--local-epochs",type=int); group.add_argument("--local-steps",type=int)
+    p.add_argument("--initial-graph",choices=("canonical_er","bounded_connected","ring","clustered","disconnected_clusters")); p.add_argument("--participation-rate",type=float,default=1.); group=p.add_mutually_exclusive_group(); group.add_argument("--local-epochs",type=int); group.add_argument("--local-steps",type=int)
     p.add_argument("--batch-size",type=int); p.add_argument("--lr",type=float,default=.05); p.add_argument("--output-dir",required=True); p.add_argument("--checkpoint-interval",type=int,default=10); p.add_argument("--checkpoint-path",default=""); p.add_argument("--resume",action="store_true"); p.add_argument("--force",action="store_true")
     p.add_argument("--eval-clients",type=int,default=50); p.add_argument("--final-eval-all",dest="final_eval_all",action="store_true"); p.add_argument("--no-final-eval-all",dest="final_eval_all",action="store_false"); p.set_defaults(final_eval_all=True); p.add_argument("--data-root",default=os.getenv("LFHE_DATA_ROOT","./data")); p.add_argument("--update-mode",choices=("sequential","snapshot_concurrent"),default="sequential")
-    p.add_argument("--data-regime",choices=("fixed_total","fixed_per_client"),default="fixed_total"); p.add_argument("--samples-per-client",type=int)
+    p.add_argument("--data-regime",choices=("fixed_total","fixed_per_client","fixed_samples_per_client"),default="fixed_total"); p.add_argument("--samples-per-client",type=int)
+    p.add_argument("--degree-regime",choices=("ordinary","fixed2","fixed4","fixed8","log2"),default="ordinary")
+    p.add_argument("--checkpoint-policy",dest="checkpoint_policy_override",choices=("auto","full","disabled"),default="auto")
     p.add_argument("--link-failure-rate",type=float,default=0.); p.add_argument("--stale-view-rounds",type=int,default=0); p.add_argument("--repair-warning-fraction",type=float,default=.05)
     p.add_argument("--min-samples-per-client",type=int); p.add_argument("--representation-mode",choices=("flatten","class_mean"),default="flatten"); p.add_argument("--lfhe-start-round",type=int,default=0); p.add_argument("--target-accuracy",type=float,default=.65); p.add_argument("--graph-metric-interval",type=int,default=25); p.add_argument("--dissdl-max-n",type=int,default=500); p.add_argument("--num-workers",type=int,default=0); return p
 
@@ -730,7 +751,7 @@ def make_config(a):
     if not 0<=a.link_failure_rate<1: raise ValueError("link-failure-rate must be in [0,1)")
     if a.stale_view_rounds<0: raise ValueError("stale-view-rounds must be >=0")
     if a.lfhe_start_round<0: raise ValueError("lfhe-start-round must be >=0")
-    if a.data_regime=="fixed_per_client" and (a.samples_per_client is None or a.samples_per_client<1): raise ValueError("fixed_per_client requires --samples-per-client")
+    if a.data_regime in ("fixed_per_client","fixed_samples_per_client") and (a.samples_per_client is None or a.samples_per_client<1): raise ValueError("fixed samples per client requires --samples-per-client")
     if a.samples_per_client is not None and a.samples_per_client*a.num_clients>50000: raise ValueError("requested fixed-per-client data exceeds CIFAR-10 training set")
     if canonical and a.participation_rate!=1: raise ValueError("canonical protocol requires full participation")
     if canonical:
@@ -741,7 +762,7 @@ def make_config(a):
         raise ValueError(f"Morph requires morph.py exposing MorphNode: {MORPH_IMPORT_ERROR}")
     if a.method=="dissdl" and a.num_clients>a.dissdl_max_n: raise ValueError("DissDL disabled above --dissdl-max-n due to its all-client known-peer directory")
     if a.method=="fedavg" and initial=="bounded_connected": initial="canonical_er"
-    return Config(a.method,a.num_clients,a.seed,rounds,a.protocol,a.alpha,a.dmax,dmax,topo,ev,initial,a.participation_rate,epochs,steps,batch,a.lr,a.output_dir,a.checkpoint_interval,a.checkpoint_path,a.resume,a.force,a.eval_clients,a.final_eval_all,a.data_root,a.update_mode,minimum,a.target_accuracy,a.graph_metric_interval,a.dissdl_max_n,a.num_workers,a.samples_per_client,a.link_failure_rate,a.stale_view_rounds,a.repair_warning_fraction,a.representation_mode,a.lfhe_start_round,data_regime=a.data_regime)
+    return Config(a.method,a.num_clients,a.seed,rounds,a.protocol,a.alpha,a.dmax,dmax,topo,ev,initial,a.participation_rate,epochs,steps,batch,a.lr,a.output_dir,a.checkpoint_interval,a.checkpoint_path,a.resume,a.force,a.eval_clients,a.final_eval_all,a.data_root,a.update_mode,minimum,a.target_accuracy,a.graph_metric_interval,a.dissdl_max_n,a.num_workers,a.samples_per_client,a.link_failure_rate,a.stale_view_rounds,a.repair_warning_fraction,a.representation_mode,a.lfhe_start_round,data_regime=a.data_regime,degree_regime=a.degree_regime,checkpoint_policy_override=a.checkpoint_policy_override)
 
 def main():
     try:
