@@ -4,13 +4,13 @@ import hashlib
 import json
 import random
 from dataclasses import dataclass, replace
-from typing import Iterable, Mapping, Sequence
+from typing import Iterable, Mapping, Sequence, Tuple, Tuple
 
 import networkx as nx
 import numpy as np
 
 
-Edge = tuple[int, int]
+Edge = Tuple[int, int]
 
 
 class LFHEPACInvariantError(RuntimeError):
