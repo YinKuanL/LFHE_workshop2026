@@ -32,5 +32,12 @@ def main():
     keys=[(r['method'],r['num_clients'],r['seed'],r['dmax']) for r in degree]; assert len(keys)==len(set(keys))
     fixed=list(csv.DictReader((ROOT/'manifests/workshop_fixed_per_client.csv').open()))
     assert {int(r['num_clients'])*int(r['samples_per_client']) for r in fixed}=={10000,20000,50000}
+    pac=list(csv.DictReader((ROOT/'manifests/workshop_lfhe_pac_main.csv').open()))
+    assert len(pac)==20
+    assert {int(r['num_clients']) for r in pac}=={50,100,200,500}
+    for n in (50,100,200,500):
+        group=[r for r in pac if int(r['num_clients'])==n]; assert len(group)==5 and {int(r['seed']) for r in group}==set(range(42,47))
+    assert len({r['output_dir'] for r in pac})==20 and all(r['method']=='lfhe_pac' and r['rounds']=='300' and r['alpha']=='0.3' and r['dmax']=='4' and r['data_regime']=='fixed_total' and r['participation_rate']=='1.0' and r['final_eval_all']=='true' for r in pac)
+    print("validated LFHE-PAC: 20 rows; N=50/100/200/500 each 5; seeds=42-46; unique outputs; method=lfhe_pac; rounds=300; alpha=0.3; dmax=4; fixed_total; full participation; final eval all")
     print("validated",sum(generator.EXPECTED.values()),"workshop rows across",len(generator.EXPECTED),"manifests")
 if __name__=="__main__": main()
