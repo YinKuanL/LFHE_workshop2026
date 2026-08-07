@@ -4,7 +4,7 @@ import hashlib
 import json
 import random
 from dataclasses import dataclass, replace
-from typing import Iterable, Mapping, Sequence, Tuple, Tuple
+from typing import Iterable, Mapping, Sequence, Tuple
 
 import networkx as nx
 import numpy as np
@@ -151,32 +151,6 @@ class LFHEPACState:
             }
         )
 
-    def checkpoint(self) -> dict[str, object]:
-        """JSON/torch-serializable official protocol state (locks are transient)."""
-        return {
-            "num_nodes": self.num_nodes,
-            "protected_edges": _edge_payload(self.protected_edges),
-            "adaptive_edges": _edge_payload(self.adaptive_edges),
-            "dmax": self.dmax,
-            "edge_budget": self.edge_budget,
-            "versions": dict(self.versions),
-            "locks": dict(self.locks),
-        }
-
-    @classmethod
-    def restore(cls, value: Mapping[str, object]) -> "LFHEPACState":
-        state = cls(
-            num_nodes=int(value["num_nodes"]),
-            protected_edges=value["protected_edges"],
-            adaptive_edges=value["adaptive_edges"],
-            dmax=int(value["dmax"]),
-            edge_budget=int(value["edge_budget"]),
-        )
-        state.versions = {int(k): int(v) for k, v in dict(value["versions"]).items()}
-        state.locks = {int(k): str(v) for k, v in dict(value.get("locks", {})).items()}
-        state.validate()
-        return state
-
     def validate(self) -> None:
         all_edges = self.protected_edges | self.adaptive_edges
         if self.protected_edges & self.adaptive_edges:
@@ -246,29 +220,24 @@ def build_random_heterogeneous_state(
     edge_budget: int | None = None,
     max_attempts: int = 100_000,
 ) -> LFHEPACState:
-    """Construct a deterministic connected, heterogeneous hard-capped graph."""
+    """Generate a random connected, simple, heterogeneous hard-capped graph."""
 
     target_edges = int(round(num_nodes * average_degree / 2.0))
     capacity = num_nodes * dmax // 2
     if target_edges < num_nodes - 1 or target_edges > capacity:
         raise ValueError("requested average degree is incompatible with connectivity/Dmax")
-    # A shuffled Hamiltonian cycle provides connectivity without rejection.
-    # Deterministically shuffled chords then fill the exact degree-3 budget.
-    # This avoids the vanishing acceptance rate of capped G(n,m) at N=500.
-    for attempt in range(min(max_attempts, 256)):
-        rng = random.Random(seed * 1_000_003 + attempt * 104_729)
-        order = list(range(num_nodes)); rng.shuffle(order)
-        graph = nx.Graph(); graph.add_nodes_from(range(num_nodes))
-        graph.add_edges_from((order[i], order[(i + 1) % num_nodes]) for i in range(num_nodes))
-        pairs = [(u, v) for u in range(num_nodes) for v in range(u + 1, num_nodes)]
-        rng.shuffle(pairs)
-        for u, v in pairs:
-            if graph.number_of_edges() == target_edges:
-                break
-            if not graph.has_edge(u, v) and graph.degree(u) < dmax and graph.degree(v) < dmax:
-                graph.add_edge(u, v)
+    for attempt in range(max_attempts):
+        graph = nx.gnm_random_graph(
+            num_nodes,
+            target_edges,
+            seed=seed * 1_000_003 + attempt * 104_729,
+        )
         degrees = dict(graph.degree())
-        if graph.number_of_edges() != target_edges or len(set(degrees.values())) < 2:
+        if not nx.is_connected(graph):
+            continue
+        if max(degrees.values(), default=0) > dmax:
+            continue
+        if len(set(degrees.values())) < 2:
             continue
         protected = _deterministic_spanning_tree(graph, seed)
         adaptive = frozenset(canonical_edge(edge) for edge in graph.edges()) - protected
@@ -411,6 +380,28 @@ class LFHEPACProposal:
     @property
     def minimum_gain(self) -> float:
         return min(gain for _, gain in self.endpoint_gains)
+
+    @property
+    def mean_gain(self) -> float:
+        return float(np.mean([gain for _, gain in self.endpoint_gains]))
+
+    @property
+    def candidate_gain(self) -> float:
+        return self.gain_for(self.fof_path[2])
+
+    @property
+    def removed_neighbor_gain(self) -> float | None:
+        if self.removed_neighbor is None:
+            return None
+        return self.gain_for(self.removed_neighbor)
+
+    @property
+    def has_negative_noninitiator_gain(self) -> bool:
+        return any(
+            gain < 0.0
+            for endpoint, gain in self.endpoint_gains
+            if endpoint != self.initiator
+        )
 
 
 def _proposal_evidence_payload(proposal: LFHEPACProposal) -> dict[str, object]:
@@ -560,21 +551,31 @@ def feasible_operation_hash(proposals: Sequence[LFHEPACProposal]) -> str:
     )
 
 
-def _pac_priority(proposal: LFHEPACProposal) -> tuple[float, float, int, str]:
+def _pac_priority(proposal: LFHEPACProposal) -> tuple[float, float, str]:
+    """Deterministic local priority; smaller tuples have higher priority."""
+
     return (
         -proposal.initiator_gain,
         -proposal.minimum_gain,
-        0 if proposal.operation == "addition" else 1,
         proposal.txid,
     )
 
 
+def _canonical_method(method: str) -> str:
+    aliases = {
+        "lfhe_pac_initiator_only": "lfhe_pac_v2",
+        "lfhe_pac": "lfhe_pac_strict",
+    }
+    return aliases.get(method, method)
+
+
 def _passes_method_score(proposal: LFHEPACProposal, method: str) -> bool:
+    method = _canonical_method(method)
     if method == "random_fof_matched":
         return True
     if proposal.initiator_gain <= 0.0:
         return False
-    if method in {"lfhe_pac_initiator_only", "lfhe_pac"}:
+    if method in {"lfhe_pac_v2", "lfhe_pac_strict"}:
         return True
     raise ValueError(f"unsupported PAC method: {method}")
 
@@ -585,6 +586,7 @@ def select_one_proposal_per_initiator(
     method: str,
     seed: int,
 ) -> tuple[LFHEPACProposal, ...]:
+    method = _canonical_method(method)
     selected: list[LFHEPACProposal] = []
     initiators = sorted({proposal.initiator for proposal in feasible})
     for initiator in initiators:
@@ -672,18 +674,22 @@ def _topology_validation_reason(
             return "old_edge_missing_or_protected"
     if endpoint in proposal.new_edge and graph.has_edge(*proposal.new_edge):
         return "new_edge_exists"
-    candidate = graph.copy()
-    if proposal.old_edge is not None:
-        if not candidate.has_edge(*proposal.old_edge):
-            return "old_edge_missing_or_protected"
-        candidate.remove_edge(*proposal.old_edge)
-    candidate.add_edge(*proposal.new_edge)
-    if candidate.degree(endpoint) > state.dmax:
+    # Each endpoint checks only its own incident degree delta. It does not read
+    # or validate another endpoint's adjacency list.
+    degree_delta = int(endpoint in proposal.new_edge) - int(
+        proposal.old_edge is not None and endpoint in proposal.old_edge
+    )
+    proposed_degree = graph.degree(endpoint) + degree_delta
+    if proposed_degree > state.dmax:
         return "hard_degree_cap"
-    if proposal.operation == "swap" and proposal.removed_neighbor is not None:
-        if candidate.degree(proposal.removed_neighbor) < 1:
-            return "removed_endpoint_isolated"
-    if candidate.number_of_edges() > state.edge_budget:
+    if proposed_degree < 1:
+        return "removed_endpoint_isolated"
+    # The initiator owns the epoch action/edge-budget token for an addition.
+    if (
+        endpoint == proposal.initiator
+        and proposal.operation == "addition"
+        and state.edge_count >= state.edge_budget
+    ):
         return "edge_budget"
     return None
 
@@ -694,8 +700,7 @@ def _score_validation_reason(
     endpoint: int,
     method: str,
 ) -> str | None:
-    if method == "random_fof_matched":
-        return None
+    method = _canonical_method(method)
     old_graph = snapshot.graph
     proposed_graph = old_graph.copy()
     if proposal.old_edge is not None:
@@ -707,11 +712,13 @@ def _score_validation_reason(
     ) - normalized_structural_score(endpoint, old_graph, representations)
     if gain != proposal.gain_for(endpoint):
         return "inconsistent_local_score_evidence"
+    if method == "random_fof_matched":
+        return None
     if endpoint == proposal.initiator:
         return None if gain > 0.0 else "initiator_score_veto"
-    if method == "lfhe_pac_initiator_only":
+    if method == "lfhe_pac_v2":
         return None
-    if method == "lfhe_pac":
+    if method == "lfhe_pac_strict":
         return None if gain >= 0.0 else "noninitiator_score_veto"
     raise ValueError(f"unsupported PAC method: {method}")
 
@@ -722,9 +729,8 @@ def _endpoint_priority(
     method: str,
     seed: int,
 ) -> tuple[object, ...]:
-    if method == "random_fof_matched":
-        digest = hashlib.sha256(f"{seed}:{proposal.txid}".encode()).hexdigest()
-        return (digest, proposal.txid)
+    # Candidate selection is random for Random-FoF, but conflict resolution is
+    # deliberately protocol-matched and endpoint-local for all three methods.
     return _pac_priority(proposal)
 
 
@@ -773,7 +779,8 @@ def run_pac_epoch(
 ) -> PACEpochResult:
     """Simulate endpoint-local arbitration and atomic PAC transactions."""
 
-    if method not in {"random_fof_matched", "lfhe_pac_initiator_only", "lfhe_pac"}:
+    method = _canonical_method(method)
+    if method not in {"random_fof_matched", "lfhe_pac_v2", "lfhe_pac_strict"}:
         raise ValueError(f"unsupported PAC method: {method}")
     timeouts = set(force_timeout_txids)
     inboxes: dict[int, list[LFHEPACProposal]] = {node: [] for node in range(state.num_nodes)}
@@ -932,6 +939,12 @@ def proposal_log_rows(
                 "scores_before": dict(proposal.scores_before),
                 "scores_after": dict(proposal.scores_after),
                 "endpoint_gains": dict(proposal.endpoint_gains),
+                "initiator_gain": proposal.initiator_gain,
+                "candidate_gain": proposal.candidate_gain,
+                "removed_neighbor_gain": proposal.removed_neighbor_gain,
+                "any_negative_noninitiator_gain": proposal.has_negative_noninitiator_gain,
+                "minimum_affected_endpoint_gain": proposal.minimum_gain,
+                "mean_affected_endpoint_gain": proposal.mean_gain,
                 "endpoint_responses": [response.__dict__ for response in response_map.get(proposal.txid, [])],
                 "committed": outcome.committed,
                 "final_reason": outcome.reason,
