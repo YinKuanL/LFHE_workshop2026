@@ -6,7 +6,8 @@ import numpy as np
 
 from lfhe_pac import (LFHEPACState, build_random_heterogeneous_state,
     discover_frozen_fof, enumerate_feasible_operations, feasible_operation_hash,
-    run_pac_epoch, select_one_proposal_per_initiator)
+    representation_swap_score, run_pac_epoch,
+    select_one_proposal_per_initiator)
 
 ROOT=Path(__file__).resolve().parents[1]
 
@@ -36,6 +37,21 @@ def test_epoch_fixed_budget_lock_cleanup_and_checkpoint_roundtrip():
     assert value.edge_count==before and not value.locks and nx.is_connected(value.graph) and max(dict(value.graph.degree()).values())<=4
     restored=LFHEPACState.restore(value.checkpoint()); assert restored.fingerprint()==value.fingerprint()
     assert result.committed_additions==0
+
+def test_new_lfhe_and_random_fof_are_fixed_edge_swap_pair():
+    for method,score_function in (
+        ("random_fof_swap",None),
+        ("lfhe_representation_swap",representation_swap_score),
+    ):
+        value=state(); snap=snapshot(value); before=value.edge_count
+        stream=discover_frozen_fof(snap,candidate_budget=5,seed=42)
+        feasible=enumerate_feasible_operations(snap,stream,**({"score_function":score_function} if score_function else {}))
+        feasible=tuple(proposal for proposal in feasible if proposal.operation=="swap")
+        selected=select_one_proposal_per_initiator(feasible,method=method,seed=42)
+        result=run_pac_epoch(value,snap,selected,method=method,max_commits=12,seed=42,**({"score_function":score_function} if score_function else {}))
+        assert all(proposal.operation=="swap" for proposal in feasible)
+        assert value.edge_count==before and result.committed_additions==0
+        assert nx.is_connected(value.graph) and max(dict(value.graph.degree()).values())<=4
 
 def test_manifest_contract():
     rows=list(csv.DictReader((ROOT/'manifests/workshop_lfhe_pac_main.csv').open()))

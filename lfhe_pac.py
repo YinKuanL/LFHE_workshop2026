@@ -4,7 +4,7 @@ import hashlib
 import json
 import random
 from dataclasses import dataclass, replace
-from typing import Iterable, Mapping, Sequence, Tuple
+from typing import Callable, Iterable, Mapping, Sequence, Tuple
 
 import networkx as nx
 import numpy as np
@@ -198,6 +198,34 @@ class LFHEPACState:
             representation_timestamp=int(timestamp),
         )
 
+    def checkpoint(self) -> dict[str, object]:
+        """Serializable protocol state; transaction locks are transient."""
+        return {
+            "num_nodes": self.num_nodes,
+            "protected_edges": _edge_payload(self.protected_edges),
+            "adaptive_edges": _edge_payload(self.adaptive_edges),
+            "dmax": self.dmax,
+            "edge_budget": self.edge_budget,
+            "versions": dict(self.versions),
+        }
+
+    @classmethod
+    def restore(cls, value: Mapping[str, object]) -> "LFHEPACState":
+        state = cls(
+            num_nodes=int(value["num_nodes"]),
+            protected_edges=value["protected_edges"],
+            adaptive_edges=value["adaptive_edges"],
+            dmax=int(value["dmax"]),
+            edge_budget=int(value["edge_budget"]),
+        )
+        state.versions = {
+            int(endpoint): int(version)
+            for endpoint, version in dict(value["versions"]).items()
+        }
+        state.locks = {}
+        state.validate()
+        return state
+
 
 def _deterministic_spanning_tree(graph: nx.Graph, seed: int) -> frozenset[Edge]:
     weighted = nx.Graph()
@@ -220,24 +248,33 @@ def build_random_heterogeneous_state(
     edge_budget: int | None = None,
     max_attempts: int = 100_000,
 ) -> LFHEPACState:
-    """Generate a random connected, simple, heterogeneous hard-capped graph."""
+    """Generate a seeded connected simple graph under the hard degree cap."""
 
     target_edges = int(round(num_nodes * average_degree / 2.0))
     capacity = num_nodes * dmax // 2
     if target_edges < num_nodes - 1 or target_edges > capacity:
         raise ValueError("requested average degree is incompatible with connectivity/Dmax")
-    for attempt in range(max_attempts):
-        graph = nx.gnm_random_graph(
-            num_nodes,
-            target_edges,
-            seed=seed * 1_000_003 + attempt * 104_729,
-        )
+    for attempt in range(min(max_attempts, 256)):
+        rng = random.Random(seed * 1_000_003 + attempt * 104_729)
+        order = list(range(num_nodes)); rng.shuffle(order)
+        graph = nx.Graph(); graph.add_nodes_from(range(num_nodes))
+        if target_edges == num_nodes - 1:
+            graph.add_edges_from((order[i], order[i + 1]) for i in range(num_nodes - 1))
+        else:
+            graph.add_edges_from((order[i], order[(i + 1) % num_nodes]) for i in range(num_nodes))
+        pairs = [(u, v) for u in range(num_nodes) for v in range(u + 1, num_nodes)]
+        rng.shuffle(pairs)
+        for u, v in pairs:
+            if graph.number_of_edges() == target_edges:
+                break
+            if not graph.has_edge(u, v) and graph.degree(u) < dmax and graph.degree(v) < dmax:
+                graph.add_edge(u, v)
         degrees = dict(graph.degree())
-        if not nx.is_connected(graph):
+        if graph.number_of_edges() != target_edges or not nx.is_connected(graph):
             continue
         if max(degrees.values(), default=0) > dmax:
             continue
-        if len(set(degrees.values())) < 2:
+        if len(set(degrees.values())) < 2 and target_edges < capacity:
             continue
         protected = _deterministic_spanning_tree(graph, seed)
         adaptive = frozenset(canonical_edge(edge) for edge in graph.edges()) - protected
@@ -267,6 +304,23 @@ def normalized_structural_score(
         gap = own - np.asarray(representations[peer], dtype=np.float64)
         total += np.sum(gap * gap, dtype=np.float64)
     return float(total / np.float64(len(neighbors)))
+
+
+def representation_swap_score(
+    endpoint: int,
+    graph: nx.Graph,
+    representations: Mapping[int, np.ndarray],
+) -> float:
+    """Frozen cosine-novelty potential of edges incident to one endpoint."""
+
+    own = np.asarray(representations[int(endpoint)], dtype=np.float64)
+    own_hat = own / (np.linalg.norm(own) + np.finfo(np.float64).eps)
+    total = np.float64(0.0)
+    for peer in sorted(int(value) for value in graph.neighbors(int(endpoint))):
+        other = np.asarray(representations[peer], dtype=np.float64)
+        other_hat = other / (np.linalg.norm(other) + np.finfo(np.float64).eps)
+        total += np.float64(1.0) - np.dot(own_hat, other_hat)
+    return float(total)
 
 
 @dataclass(frozen=True)
@@ -427,6 +481,7 @@ def _make_proposal(
     packet: FoFCandidatePacket,
     *,
     removed_neighbor: int | None,
+    score_function: Callable[[int, nx.Graph, Mapping[int, np.ndarray]], float],
 ) -> LFHEPACProposal:
     operation = "addition" if removed_neighbor is None else "swap"
     old_edge = (
@@ -447,11 +502,11 @@ def _make_proposal(
     candidate_graph.add_edge(*new_edge)
     representations = dict(snapshot.representations)
     before = tuple(
-        (q, normalized_structural_score(q, snapshot.graph, representations))
+        (q, score_function(q, snapshot.graph, representations))
         for q in affected
     )
     after = tuple(
-        (q, normalized_structural_score(q, candidate_graph, representations))
+        (q, score_function(q, candidate_graph, representations))
         for q in affected
     )
     gains = tuple(
@@ -487,6 +542,9 @@ def enumerate_feasible_operations(
     stream: FrozenFoFStream,
     *,
     initiator_order: Sequence[int] | None = None,
+    score_function: Callable[
+        [int, nx.Graph, Mapping[int, np.ndarray]], float
+    ] = normalized_structural_score,
 ) -> tuple[LFHEPACProposal, ...]:
     if stream.topology_hash != snapshot.topology_hash:
         raise ValueError("candidate stream topology mismatch")
@@ -507,7 +565,9 @@ def enumerate_feasible_operations(
             and graph.degree(k) < snapshot.dmax
             and graph.number_of_edges() < snapshot.edge_budget
         ):
-            proposal = _make_proposal(snapshot, packet, removed_neighbor=None)
+            proposal = _make_proposal(
+                snapshot, packet, removed_neighbor=None, score_function=score_function
+            )
             proposals[
                 (
                     proposal.initiator,
@@ -524,7 +584,12 @@ def enumerate_feasible_operations(
                 continue
             if graph.degree(removed) - 1 < 1:
                 continue
-            proposal = _make_proposal(snapshot, packet, removed_neighbor=int(removed))
+            proposal = _make_proposal(
+                snapshot,
+                packet,
+                removed_neighbor=int(removed),
+                score_function=score_function,
+            )
             proposals[
                 (
                     proposal.initiator,
@@ -571,11 +636,11 @@ def _canonical_method(method: str) -> str:
 
 def _passes_method_score(proposal: LFHEPACProposal, method: str) -> bool:
     method = _canonical_method(method)
-    if method == "random_fof_matched":
+    if method in {"random_fof_matched", "random_fof_swap"}:
         return True
     if proposal.initiator_gain <= 0.0:
         return False
-    if method in {"lfhe_pac_v2", "lfhe_pac_strict"}:
+    if method in {"lfhe_pac_v2", "lfhe_pac_strict", "lfhe_representation_swap"}:
         return True
     raise ValueError(f"unsupported PAC method: {method}")
 
@@ -597,7 +662,7 @@ def select_one_proposal_per_initiator(
         ]
         if not options:
             continue
-        if method == "random_fof_matched":
+        if method in {"random_fof_matched", "random_fof_swap"}:
             options = sorted(options, key=lambda proposal: proposal.txid)
             choice = random.Random(
                 seed * 1_000_003
@@ -699,6 +764,7 @@ def _score_validation_reason(
     proposal: LFHEPACProposal,
     endpoint: int,
     method: str,
+    score_function: Callable[[int, nx.Graph, Mapping[int, np.ndarray]], float],
 ) -> str | None:
     method = _canonical_method(method)
     old_graph = snapshot.graph
@@ -707,16 +773,16 @@ def _score_validation_reason(
         proposed_graph.remove_edge(*proposal.old_edge)
     proposed_graph.add_edge(*proposal.new_edge)
     representations = dict(snapshot.representations)
-    gain = normalized_structural_score(
-        endpoint, proposed_graph, representations
-    ) - normalized_structural_score(endpoint, old_graph, representations)
+    gain = score_function(endpoint, proposed_graph, representations) - score_function(
+        endpoint, old_graph, representations
+    )
     if gain != proposal.gain_for(endpoint):
         return "inconsistent_local_score_evidence"
-    if method == "random_fof_matched":
+    if method in {"random_fof_matched", "random_fof_swap"}:
         return None
     if endpoint == proposal.initiator:
         return None if gain > 0.0 else "initiator_score_veto"
-    if method == "lfhe_pac_v2":
+    if method in {"lfhe_pac_v2", "lfhe_representation_swap"}:
         return None
     if method == "lfhe_pac_strict":
         return None if gain >= 0.0 else "noninitiator_score_veto"
@@ -729,8 +795,12 @@ def _endpoint_priority(
     method: str,
     seed: int,
 ) -> tuple[object, ...]:
-    # Candidate selection is random for Random-FoF, but conflict resolution is
-    # deliberately protocol-matched and endpoint-local for all three methods.
+    method = _canonical_method(method)
+    if method == "random_fof_swap":
+        payload = (
+            f"random-fof-swap|{seed}|{proposal.representation_timestamp}|{proposal.txid}"
+        ).encode("utf-8")
+        return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big"), proposal.txid
     return _pac_priority(proposal)
 
 
@@ -776,11 +846,17 @@ def run_pac_epoch(
     max_commits: int,
     seed: int,
     force_timeout_txids: Iterable[str] = (),
+    score_function: Callable[
+        [int, nx.Graph, Mapping[int, np.ndarray]], float
+    ] = normalized_structural_score,
 ) -> PACEpochResult:
     """Simulate endpoint-local arbitration and atomic PAC transactions."""
 
     method = _canonical_method(method)
-    if method not in {"random_fof_matched", "lfhe_pac_v2", "lfhe_pac_strict"}:
+    if method not in {
+        "random_fof_matched", "random_fof_swap", "lfhe_pac_v2",
+        "lfhe_pac_strict", "lfhe_representation_swap",
+    }:
         raise ValueError(f"unsupported PAC method: {method}")
     timeouts = set(force_timeout_txids)
     inboxes: dict[int, list[LFHEPACProposal]] = {node: [] for node in range(state.num_nodes)}
@@ -800,7 +876,9 @@ def run_pac_epoch(
         for proposal in touching:
             reason = _topology_validation_reason(state, snapshot, proposal, endpoint)
             if reason is None:
-                reason = _score_validation_reason(snapshot, proposal, endpoint, method)
+                reason = _score_validation_reason(
+                    snapshot, proposal, endpoint, method, score_function
+                )
             if reason is None:
                 valid.append(proposal)
             else:
