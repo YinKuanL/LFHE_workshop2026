@@ -6,7 +6,7 @@ import numpy as np
 
 from lfhe_pac import (LFHEPACState, build_random_heterogeneous_state,
     discover_frozen_fof, enumerate_feasible_operations, feasible_operation_hash,
-    representation_swap_score, run_pac_epoch,
+    graph_jaccard_swap_score, representation_swap_score, run_pac_epoch,
     select_one_proposal_per_initiator)
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -52,6 +52,12 @@ def test_new_lfhe_and_random_fof_are_fixed_edge_swap_pair():
         assert all(proposal.operation=="swap" for proposal in feasible)
         assert value.edge_count==before and result.committed_additions==0
         assert nx.is_connected(value.graph) and max(dict(value.graph.degree()).values())<=4
+
+def test_graph_jaccard_control_is_model_information_free():
+    value=state(); graph=value.graph
+    zeros={i:np.zeros(3,dtype=np.float64) for i in graph}
+    random_reps={i:np.asarray([i+1,i*i+2,i%7+3],dtype=np.float64) for i in graph}
+    assert graph_jaccard_swap_score(0,graph,zeros)==graph_jaccard_swap_score(0,graph,random_reps)
 
 def test_manifest_contract():
     rows=list(csv.DictReader((ROOT/'manifests/workshop_lfhe_pac_main.csv').open()))

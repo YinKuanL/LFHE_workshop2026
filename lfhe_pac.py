@@ -254,6 +254,90 @@ def build_random_heterogeneous_state(
     capacity = num_nodes * dmax // 2
     if target_edges < num_nodes - 1 or target_edges > capacity:
         raise ValueError("requested average degree is incompatible with connectivity/Dmax")
+    # Preserve the historical N=30 construction exactly.  At larger sizes,
+    # rejection sampling under a tight degree cap becomes vanishingly likely.
+    historical_attempts = max_attempts if num_nodes == 30 else 0
+    for attempt in range(historical_attempts):
+        graph = nx.gnm_random_graph(
+            num_nodes,
+            target_edges,
+            seed=seed * 1_000_003 + attempt * 104_729,
+        )
+        degrees = dict(graph.degree())
+        if not nx.is_connected(graph):
+            continue
+        if max(degrees.values(), default=0) > dmax:
+            continue
+        if len(set(degrees.values())) < 2:
+            continue
+        protected = _deterministic_spanning_tree(graph, seed)
+        adaptive = frozenset(canonical_edge(edge) for edge in graph.edges()) - protected
+        return LFHEPACState(
+            num_nodes=num_nodes,
+            protected_edges=protected,
+            adaptive_edges=adaptive,
+            dmax=dmax,
+            edge_budget=capacity if edge_budget is None else int(edge_budget),
+        )
+
+    # Construct a connected regular graph, then perturb one non-bridge edge to
+    # obtain heterogeneous degrees without changing the edge count.
+    if (
+        num_nodes != 30
+        and average_degree >= 2
+        and average_degree < dmax
+        and (num_nodes * average_degree) % 2 == 0
+    ):
+        for attempt in range(100):
+            graph = nx.random_regular_graph(
+                average_degree,
+                num_nodes,
+                seed=seed * 1_000_003 + attempt * 104_729,
+            )
+            if not nx.is_connected(graph):
+                continue
+            bridges = {canonical_edge(edge) for edge in nx.bridges(graph)}
+            edges = sorted(canonical_edge(edge) for edge in graph.edges())
+            nodes = list(range(num_nodes))
+            random.Random(seed * 65_537 + attempt).shuffle(edges)
+            random.Random(seed * 131_071 + attempt).shuffle(nodes)
+            perturbed = False
+            for left, removed in edges:
+                if (left, removed) in bridges:
+                    continue
+                for candidate in nodes:
+                    if candidate in {left, removed} or graph.has_edge(left, candidate):
+                        continue
+                    if graph.degree(candidate) >= dmax:
+                        continue
+                    graph.remove_edge(left, removed)
+                    graph.add_edge(left, candidate)
+                    perturbed = True
+                    break
+                if perturbed:
+                    break
+            degrees = dict(graph.degree())
+            if (
+                perturbed
+                and nx.is_connected(graph)
+                and graph.number_of_edges() == target_edges
+                and max(degrees.values(), default=0) <= dmax
+                and len(set(degrees.values())) >= 2
+            ):
+                protected = _deterministic_spanning_tree(graph, seed)
+                adaptive = (
+                    frozenset(canonical_edge(edge) for edge in graph.edges())
+                    - protected
+                )
+                return LFHEPACState(
+                    num_nodes=num_nodes,
+                    protected_edges=protected,
+                    adaptive_edges=adaptive,
+                    dmax=dmax,
+                    edge_budget=capacity if edge_budget is None else int(edge_budget),
+                )
+
+    # General fallback also covers the saturated Dmax=2 cycle regime.
     for attempt in range(min(max_attempts, 256)):
         rng = random.Random(seed * 1_000_003 + attempt * 104_729)
         order = list(range(num_nodes)); rng.shuffle(order)
@@ -320,6 +404,25 @@ def representation_swap_score(
         other = np.asarray(representations[peer], dtype=np.float64)
         other_hat = other / (np.linalg.norm(other) + np.finfo(np.float64).eps)
         total += np.float64(1.0) - np.dot(own_hat, other_hat)
+    return float(total)
+
+
+def graph_jaccard_swap_score(
+    endpoint: int,
+    graph: nx.Graph,
+    _representations: Mapping[int, np.ndarray],
+) -> float:
+    """Graph-only incident-edge novelty potential for a matched swap control."""
+
+    endpoint = int(endpoint)
+    own = set(int(value) for value in graph.neighbors(endpoint))
+    total = np.float64(0.0)
+    for peer in sorted(own):
+        other = set(int(value) for value in graph.neighbors(peer))
+        union = (own | other) - {endpoint, peer}
+        intersection = (own & other) - {endpoint, peer}
+        redundancy = len(intersection) / len(union) if union else 0.0
+        total += np.float64(1.0 - redundancy)
     return float(total)
 
 
