@@ -775,7 +775,9 @@ def batch_parser():
     p.add_argument("--degree-clients",default="100,500,1000,2000")
     p.add_argument("--partial-clients",default="1000,1500,2000")
     p.add_argument("--force",action="store_true",help="Delete and rerun completed/incomplete outputs.")
-    p.add_argument("--continue-on-error",action=argparse.BooleanOptionalAction,default=True)
+    p.add_argument("--continue-on-error",dest="continue_on_error",action="store_true")
+    p.add_argument("--no-continue-on-error",dest="continue_on_error",action="store_false")
+    p.set_defaults(continue_on_error=True)
     p.add_argument("--dry-run",action="store_true")
     return p
 
@@ -873,7 +875,7 @@ def parser():
     p.add_argument("--eval-clients",type=int,default=50); p.add_argument("--final-eval-all",dest="final_eval_all",action="store_true"); p.add_argument("--no-final-eval-all",dest="final_eval_all",action="store_false"); p.set_defaults(final_eval_all=True); p.add_argument("--data-root",default=os.getenv("LFHE_DATA_ROOT","./data")); p.add_argument("--update-mode",choices=("sequential","snapshot_concurrent"),default="sequential")
     p.add_argument("--data-regime",choices=("fixed_total","fixed_per_client","fixed_samples_per_client"),default="fixed_total"); p.add_argument("--samples-per-client",type=int)
     p.add_argument("--degree-regime",choices=("ordinary","fixed2","fixed4","fixed8","log2"),default="ordinary")
-    p.add_argument("--shared-initial-topology",action=argparse.BooleanOptionalAction,default=False,
+    p.add_argument("--shared-initial-topology",action="store_true",default=False,
                    help="Start every method from the Static-Random bounded-connected graph")
     p.add_argument("--checkpoint-policy",dest="checkpoint_policy_override",choices=("auto","full","disabled"),default="auto")
     p.add_argument("--link-failure-rate",type=float,default=0.); p.add_argument("--stale-view-rounds",type=int,default=0); p.add_argument("--repair-warning-fraction",type=float,default=.05)

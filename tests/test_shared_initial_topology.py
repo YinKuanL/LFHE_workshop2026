@@ -1,3 +1,4 @@
+import argparse
 import csv
 import importlib.util
 from pathlib import Path
@@ -26,6 +27,23 @@ def config(method: str, n: int = 50, seed: int = 42):
 
 def undirected_edges(graph):
     return {tuple(sorted((int(left), int(right)))) for left, right in graph.to_undirected().edges()}
+
+
+def test_cli_parsers_support_python_without_boolean_optional_action(monkeypatch):
+    monkeypatch.delattr(argparse, "BooleanOptionalAction", raising=False)
+    parsed = main.parser().parse_args([
+        "--method", "lfhe",
+        "--num-clients", "50",
+        "--seed", "42",
+        "--protocol", "scalable",
+        "--output-dir", "unused",
+        "--shared-initial-topology",
+    ])
+    assert parsed.shared_initial_topology is True
+    assert main.batch_parser().parse_args(["--run-all"]).continue_on_error is True
+    assert main.batch_parser().parse_args(
+        ["--run-all", "--no-continue-on-error"]
+    ).continue_on_error is False
 
 
 def test_every_main_method_has_the_exact_static_random_initial_topology():
