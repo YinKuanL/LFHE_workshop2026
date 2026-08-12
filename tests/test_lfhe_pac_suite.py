@@ -168,6 +168,23 @@ def test_md_lfhe_seed41_rerun_manifest_contract():
     assert row['local_epochs']=='1' and row['data_regime']=='fixed_total'
     assert 'md_aligned' in row['output_dir'] and 'lfhe_expand' not in row['output_dir']
 
+
+def test_md_aligned_n100_main_pair_manifest_contract():
+    rows=list(csv.DictReader((ROOT/'manifests/workshop_md_aligned_lfhe_random_fof_n100.csv').open()))
+    assert len(rows)==10 and len({row['output_dir'] for row in rows})==10
+    assert {row['method'] for row in rows}=={'lfhe','random_fof'}
+    for method in ('lfhe','random_fof'):
+        assert {int(row['seed']) for row in rows if row['method']==method}==set(range(42,47))
+    expected={
+        'num_clients':'100','rounds':'300','protocol':'scalable','alpha':'0.3',
+        'dmax':'4','degree_regime':'fixed4','topology_interval':'5','eval_interval':'5',
+        'initial_graph':'bounded_connected','participation_rate':'1.0','local_epochs':'1',
+        'batch_size':'32','lr':'0.05','final_eval_all':'true','update_mode':'sequential',
+        'data_regime':'fixed_total','representation_mode':'flatten','lfhe_start_round':'0',
+    }
+    assert all(all(row[key]==value for key,value in expected.items()) for row in rows)
+    assert all('workshop_md_aligned_n100' in row['output_dir'] for row in rows)
+
 def test_runner_schema_is_wired():
     source=(ROOT/'main.py').read_text()
     for field in ('pac_candidate_packets.jsonl','pac_proposals.jsonl','pac_epoch_summary.jsonl','candidate_stream_hash','all_pac_invariants_passed','protected_tree_unchanged'):
