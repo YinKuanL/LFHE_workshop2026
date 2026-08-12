@@ -26,6 +26,9 @@ def test_topology_animation_reconstructs_selectable_run(tmp_path: Path):
     assert "Method<select id=\"method\"" in page
     assert "N<select id=\"n\"" in page
     assert "Seed<select id=\"seed\"" in page
+    assert "Client neighborhood" in page
+    assert "Topology only" in page
+    assert "Highlight changes" in page
     assert "added this update" in page
 
 

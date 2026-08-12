@@ -141,12 +141,16 @@ select,button,input {{ font:inherit; }}
 select,button {{ padding:6px 9px; }}
 input[type=range] {{ width:min(360px,70vw); }}
 .timeline {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin:8px 0; }}
-.stage {{ border:1px solid color-mix(in srgb, CanvasText 22%, transparent); min-height:420px; }}
+.stage {{ border:1px solid color-mix(in srgb, CanvasText 22%, transparent); min-height:520px; background:color-mix(in srgb, Canvas 96%, CanvasText 4%); }}
 svg {{ width:100%; height:auto; display:block; }}
-.base {{ stroke:color-mix(in srgb, CanvasText 28%, transparent); stroke-width:1; }}
-.added {{ stroke:#19a55a; stroke-width:2.4; }}
-.removed {{ stroke:#d64545; stroke-width:2.4; stroke-dasharray:5 3; }}
-.node {{ fill:Canvas; stroke:CanvasText; stroke-width:1.1; }}
+.base {{ stroke:color-mix(in srgb, CanvasText 38%, transparent); stroke-width:1; }}
+.added {{ stroke:#19a55a; stroke-width:3; }}
+.removed {{ stroke:#d64545; stroke-width:3; stroke-dasharray:6 4; }}
+.edge {{ vector-effect:non-scaling-stroke; }}
+.node {{ fill:Canvas; stroke:CanvasText; stroke-width:1.25; vector-effect:non-scaling-stroke; }}
+.node.changed {{ fill:#f2b84b; }}
+.node.focus {{ fill:#4b9cf2; stroke-width:2.5; }}
+.node-label {{ fill:CanvasText; font-size:5.5px; paint-order:stroke; stroke:Canvas; stroke-width:2px; stroke-linejoin:round; }}
 .legend,.status {{ display:flex; flex-wrap:wrap; gap:14px; font-size:.85rem; margin:9px 0; }}
 .swatch {{ display:inline-block; width:22px; border-top:3px solid; vertical-align:middle; margin-right:5px; }}
 .muted {{ opacity:.68; }}
@@ -160,6 +164,10 @@ svg {{ width:100%; height:auto; display:block; }}
  <label>Method<select id="method"></select></label>
  <label>N<select id="n"></select></label>
  <label>Seed<select id="seed"></select></label>
+ <label>View<select id="view"><option value="neighborhood">Client neighborhood</option><option value="overview">Full overview</option></select></label>
+ <label>Display<select id="display"><option value="topology">Topology only</option><option value="changes">Highlight changes</option></select></label>
+ <label>Client<select id="client"></select></label>
+ <label>Hops<select id="hops"><option value="1">1 hop</option><option value="2" selected>2 hops</option><option value="3">3 hops</option></select></label>
  <label>Speed<select id="speed"><option value="1200">0.5×</option><option value="600" selected>1×</option><option value="300">2×</option><option value="150">4×</option></select></label>
  <button id="play" type="button">Play</button>
  <button id="restart" type="button">Restart</button>
@@ -167,12 +175,12 @@ svg {{ width:100%; height:auto; display:block; }}
 <div class="timeline"><strong id="round">Initial</strong><input id="slider" type="range" min="0" value="0"><span id="frame"></span></div>
 <div class="status" id="status"></div>
 <div class="stage" id="stage"><svg id="graph" viewBox="0 0 1000 650" role="img" aria-label="Topology evolution"></svg></div>
-<div class="legend"><span><i class="swatch" style="border-color:#19a55a"></i>added this update</span><span><i class="swatch" style="border-color:#d64545"></i>removed this update</span><span class="muted">Layout is fixed for each run.</span></div>
+<div class="legend"><span id="added-legend"><i class="swatch" style="border-color:#19a55a"></i>added this update</span><span id="removed-legend"><i class="swatch" style="border-color:#d64545"></i>removed this update</span><span>blue node = selected client</span><span class="muted">Use Full overview for the global shape.</span></div>
 </main>
 <script>
 const runs={payload};
 const $=id=>document.getElementById(id);
-const method=$('method'), nsel=$('n'), seed=$('seed'), slider=$('slider'), graph=$('graph');
+const method=$('method'), nsel=$('n'), seed=$('seed'), view=$('view'), display=$('display'), client=$('client'), hops=$('hops'), slider=$('slider'), graph=$('graph');
 let current=null, timer=null;
 const uniq=a=>[...new Set(a)];
 function options(el,values,keep){{el.innerHTML=''; values.forEach(v=>{{let o=document.createElement('option');o.value=v;o.textContent=v;el.appendChild(o)}});if(values.map(String).includes(String(keep)))el.value=keep;}}
@@ -181,13 +189,15 @@ function refreshN(){{let rows=runs.filter(r=>r.m===method.value);options(nsel,un
 function refreshSeed(){{let rows=runs.filter(r=>r.m===method.value&&String(r.n)===nsel.value);options(seed,uniq(rows.map(r=>r.s)).sort((a,b)=>a-b),seed.value);selectRun();}}
 function edgeKey(e){{return e[0]<e[1]?e[0]+'-'+e[1]:e[1]+'-'+e[0];}}
 function stateAt(index){{let edges=new Map(current.initial.map(e=>[edgeKey(e),e]));for(let i=0;i<index;i++){{for(const e of current.frames[i].d)edges.delete(edgeKey(e));for(const e of current.frames[i].a)edges.set(edgeKey(e),e);}}return edges;}}
-function line(e,cls){{let a=point(e[0]),b=point(e[1]);return `<line class="${{cls}}" x1="${{a[0]}}" y1="${{a[1]}}" x2="${{b[0]}}" y2="${{b[1]}}"/>`;}}
+function line(e,cls){{let a=point(e[0]),b=point(e[1]);return `<line class="edge ${{cls}}" x1="${{a[0]}}" y1="${{a[1]}}" x2="${{b[0]}}" y2="${{b[1]}}"/>`;}}
 function point(i){{let p=current.positions[i];return [45+(p[0]+1)*455,45+(p[1]+1)*280];}}
-function draw(){{if(!current)return;let index=+slider.value, edges=stateAt(index), change=index?current.frames[index-1]:{{a:[],d:[]}};let added=new Set(change.a.map(edgeKey));let base=[...edges.values()].filter(e=>!added.has(edgeKey(e)));let markup=base.map(e=>line(e,'base')).join('')+change.a.map(e=>line(e,'added')).join('')+change.d.map(e=>line(e,'removed')).join('');let radius=current.n<=100?4.2:current.n<=200?3:2;markup+=current.positions.map((_,i)=>{{let p=point(i);return `<circle class="node" cx="${{p[0]}}" cy="${{p[1]}}" r="${{radius}}"><title>client ${{i}}</title></circle>`}}).join('');graph.innerHTML=markup;let label=index?`Round ${{change.r}}`:'Initial';$('round').textContent=label;$('frame').textContent=`frame ${{index}}/${{current.frames.length}}`;$('status').innerHTML=`<span><strong>${{current.m}}</strong></span><span>N=${{current.n}}</span><span>seed=${{current.s}}</span><span>edges=${{edges.size}}</span><span>+${{change.a.length}} / −${{change.d.length}}</span><span>Dmax=${{current.dmax}}</span><span>${{current.complete?'complete':'partial'}}</span>`;}}
-function selectRun(){{stop();current=runs.find(r=>r.m===method.value&&String(r.n)===nsel.value&&String(r.s)===seed.value);if(!current){{graph.innerHTML='<text x="500" y="325" text-anchor="middle">No exact edge-delta data</text>';return;}}slider.max=current.frames.length;slider.value=0;draw();}}
+function visibleNodes(edges,change){{if(view.value==='overview')return new Set(current.positions.map((_,i)=>i));let focus=+client.value,adj=Array.from({{length:current.n}},()=>[]);for(const e of edges.values()){{adj[e[0]].push(e[1]);adj[e[1]].push(e[0]);}}let visible=new Set([focus]),frontier=[focus];for(let step=0;step<+hops.value;step++){{let next=[];for(const node of frontier)for(const peer of adj[node])if(!visible.has(peer)){{visible.add(peer);next.push(peer);}}frontier=next;}}if(display.value==='changes')for(const e of [...change.a,...change.d])if(visible.has(e[0])||visible.has(e[1])){{visible.add(e[0]);visible.add(e[1]);}}return visible;}}
+function fittedViewBox(visible){{if(view.value==='overview')return '0 0 1000 650';let points=[...visible].map(point),xs=points.map(p=>p[0]),ys=points.map(p=>p[1]),xmin=Math.min(...xs),xmax=Math.max(...xs),ymin=Math.min(...ys),ymax=Math.max(...ys),w=Math.max(220,xmax-xmin+90),h=Math.max(145,ymax-ymin+90),ratio=1000/650;if(w/h>ratio)h=w/ratio;else w=h*ratio;let cx=(xmin+xmax)/2,cy=(ymin+ymax)/2;return `${{cx-w/2}} ${{cy-h/2}} ${{w}} ${{h}}`;}}
+function draw(){{if(!current)return;let index=+slider.value,edges=stateAt(index),change=index?current.frames[index-1]:{{a:[],d:[]}},visible=visibleNodes(edges,change),showChanges=display.value==='changes',added=new Set(showChanges?change.a.map(edgeKey):[]),changed=new Set(showChanges?[...change.a,...change.d].flat():[]),base=[...edges.values()].filter(e=>!added.has(edgeKey(e))&&visible.has(e[0])&&visible.has(e[1])),adds=showChanges?change.a.filter(e=>visible.has(e[0])&&visible.has(e[1])):[],removes=showChanges?change.d.filter(e=>visible.has(e[0])&&visible.has(e[1])):[];graph.setAttribute('viewBox',fittedViewBox(visible));let markup=base.map(e=>line(e,'base')).join('')+removes.map(e=>line(e,'removed')).join('')+adds.map(e=>line(e,'added')).join('');let focus=+client.value,showAllLabels=view.value==='neighborhood'&&visible.size<=35;for(const i of visible){{let p=point(i),isFocus=view.value==='neighborhood'&&i===focus,classes=`node${{changed.has(i)?' changed':''}}${{isFocus?' focus':''}}`,radius=isFocus?4.4:view.value==='overview'?(current.n<=100?4:current.n<=200?3:2):2.8;markup+=`<circle class="${{classes}}" cx="${{p[0]}}" cy="${{p[1]}}" r="${{radius}}"><title>client ${{i}}</title></circle>`;if(showAllLabels||isFocus||changed.has(i))markup+=`<text class="node-label" x="${{p[0]+4.5}}" y="${{p[1]-4.5}}">${{i}}</text>`;}}graph.innerHTML=markup;$('added-legend').hidden=!showChanges;$('removed-legend').hidden=!showChanges;let label=index?`Round ${{change.r}}`:'Initial';$('round').textContent=label;$('frame').textContent=`frame ${{index}}/${{current.frames.length}}`;$('status').innerHTML=`<span><strong>${{current.m}}</strong></span><span>N=${{current.n}}</span><span>seed=${{current.s}}</span><span>edges=${{edges.size}}</span><span>visible=${{visible.size}}</span>${{showChanges?`<span>+${{change.a.length}} / −${{change.d.length}}</span>`:''}}<span>Dmax=${{current.dmax}}</span><span>${{current.complete?'complete':'partial'}}</span>`;}}
+function selectRun(){{stop();current=runs.find(r=>r.m===method.value&&String(r.n)===nsel.value&&String(r.s)===seed.value);if(!current){{graph.innerHTML='<text x="500" y="325" text-anchor="middle">No exact edge-delta data</text>';return;}}let preferred=current.frames[0]?.a[0]?.[0]??current.frames[0]?.d[0]?.[0]??0;options(client,current.positions.map((_,i)=>i),preferred);view.value=current.n>100?'neighborhood':'overview';client.disabled=view.value==='overview';hops.disabled=view.value==='overview';slider.max=current.frames.length;slider.value=0;draw();}}
 function stop(){{if(timer)clearInterval(timer);timer=null;$('play').textContent='Play';}}
 function play(){{if(timer){{stop();return;}}if(+slider.value>=+slider.max)slider.value=0;$('play').textContent='Pause';timer=setInterval(()=>{{if(+slider.value>=+slider.max){{stop();return;}}slider.value=+slider.value+1;draw();}},+$('speed').value);}}
-method.onchange=refreshN;nsel.onchange=refreshSeed;seed.onchange=selectRun;slider.oninput=()=>{{stop();draw();}};$('play').onclick=play;$('restart').onclick=()=>{{stop();slider.value=0;draw();}};$('speed').onchange=()=>{{if(timer){{stop();play();}}}};
+method.onchange=refreshN;nsel.onchange=refreshSeed;seed.onchange=selectRun;view.onchange=()=>{{client.disabled=view.value==='overview';hops.disabled=view.value==='overview';draw();}};display.onchange=draw;client.onchange=draw;hops.onchange=draw;slider.oninput=()=>{{stop();draw();}};$('play').onclick=play;$('restart').onclick=()=>{{stop();slider.value=0;draw();}};$('speed').onchange=()=>{{if(timer){{stop();play();}}}};
 if(runs.length)refreshMethods();else $('stage').innerHTML='<div class="empty">No PAC topology-delta runs found.</div>';
 </script></body></html>"""
 
