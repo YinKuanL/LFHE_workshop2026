@@ -15,7 +15,8 @@ from torch.utils.data import DataLoader, Subset
 from epidemic import build_epidemic_graph
 from dissdl import DissDLState
 from lfhe import lfhe_update
-from lfhe_pac import (LFHEPACState, build_random_heterogeneous_state,
+from lfhe_pac import (LFHEPACState, build_pac_state_from_graph,
+    build_random_heterogeneous_state,
     discover_frozen_fof, enumerate_feasible_operations, feasible_operation_hash,
     proposal_log_rows, representation_swap_score, run_pac_epoch,
     select_one_proposal_per_initiator)
@@ -63,6 +64,7 @@ class Config:
     w1:float=1.; w2:float=1.; w3:float=.1; epsilon:float=.05
     dataset:str="cifar10"; data_regime:str="fixed_total"; optimizer:str="SGD"
     degree_regime:str="ordinary"; checkpoint_policy_override:str="auto"
+    shared_initial_topology:bool=False
 
 def set_seed(seed):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
@@ -205,6 +207,55 @@ def initial_graph(cfg):
     if cfg.initial_graph=="disconnected_clusters": return clustered_hard(cfg.num_clients,cfg.dmax,cfg.seed,False)
     return bounded_connected(cfg.num_clients,cfg.dmax,cfg.seed)
 
+def bidirectional_sender_graph(graph):
+    directed=nx.DiGraph(); directed.add_nodes_from(graph)
+    for left,right in graph.edges():
+        directed.add_edge(left,right); directed.add_edge(right,left)
+    return directed
+
+def undirected_topology_hash(graph):
+    edges=sorted((min(int(left),int(right)),max(int(left),int(right))) for left,right in graph.to_undirected().edges())
+    return hashlib.sha256(json.dumps(edges,separators=(",",":")).encode()).hexdigest().upper()
+
+def initialize_topology(cfg):
+    """Build the method graph and optional common Static-Random reference graph."""
+    common=None
+    if cfg.shared_initial_topology:
+        if cfg.initial_graph!="bounded_connected":
+            raise ValueError("shared initial topology requires bounded_connected")
+        common=bounded_connected(cfg.num_clients,cfg.dmax,cfg.seed)
+        graph=common.copy()
+    else:
+        graph=initial_graph(cfg)
+    pac_state=None
+    if cfg.method in PAC_METHODS:
+        pac_average_degree=min(3,cfg.dmax)
+        pac_edge_budget=None if cfg.method=="lfhe_expand" else round(cfg.num_clients*pac_average_degree/2)
+        if common is not None:
+            pac_state=build_pac_state_from_graph(
+                common,dmax=cfg.dmax,seed=cfg.seed,edge_budget=pac_edge_budget
+            )
+        else:
+            pac_state=build_random_heterogeneous_state(
+                num_nodes=cfg.num_clients,average_degree=pac_average_degree,
+                dmax=cfg.dmax,seed=cfg.seed,edge_budget=pac_edge_budget
+            )
+        if cfg.method in FIXED_EDGE_SWAP_METHODS:
+            pac_state.enforce_fixed_edge_count()
+        graph=pac_state.graph
+    elif common is not None and cfg.method in {"dissdl","epidemic","morph"}:
+        graph=bidirectional_sender_graph(common)
+    return graph,pac_state,common
+
+def degree_cap_violations(graph,dmax):
+    degrees=(dict(graph.in_degree()).values() if graph.is_directed() else dict(graph.degree()).values())
+    return sum(degree>dmax for degree in degrees)
+
+def epidemic_graph_for_round(cfg,graph,round_index):
+    if cfg.shared_initial_topology and round_index==0:
+        return graph
+    return build_epidemic_graph(cfg.num_clients,cfg.dmax,cfg.seed+round_index)
+
 def graph_stats(g, expensive=True):
     und=g.to_undirected(); deg=[d for _,d in und.degree()]; comps=nx.number_connected_components(und)
     out={"edges":g.number_of_edges(),"mean_degree":float(np.mean(deg)),"min_degree":min(deg),"max_degree":max(deg),
@@ -286,7 +337,8 @@ def make_morph_nodes(states, graph, cfg):
     nodes=[]
     for i,state in enumerate(states):
         model=CNN(); model.load_state_dict(state)
-        nodes.append(MorphNode(i,model,list(graph.predecessors(i)),in_degree=cfg.dmax,
+        initial_senders=list(graph.predecessors(i))
+        nodes.append(MorphNode(i,model,initial_senders,in_degree=len(initial_senders),
             beta=500.0,change_iter=cfg.topology_interval,seed=cfg.seed,
             indirect_history_k=5,device=torch.device("cpu")))
     return nodes
@@ -524,7 +576,7 @@ def run(cfg):
     set_seed(cfg.seed); out=Path(cfg.output_dir); success=out/"SUCCESS"
     if success.exists() and not cfg.force: print(f"[skip] {success} exists"); return 0
     if cfg.force and out.exists():
-        for name in ("config.json","checkpoint.pt","checkpoint.tmp","metrics.jsonl","summary.json","graph_initial.edgelist","graph_final.edgelist","SUCCESS","pac_candidate_packets.jsonl","pac_proposals.jsonl","pac_epoch_summary.jsonl","pac_edge_deltas.jsonl","protected_edges_initial.edgelist","protected_edges_final.edgelist"):
+        for name in ("config.json","checkpoint.pt","checkpoint.tmp","metrics.jsonl","summary.json","graph_initial.edgelist","graph_initial_common.edgelist","graph_final.edgelist","SUCCESS","pac_candidate_packets.jsonl","pac_proposals.jsonl","pac_epoch_summary.jsonl","pac_edge_deltas.jsonl","protected_edges_initial.edgelist","protected_edges_final.edgelist"):
             path=out/name
             if path.exists(): path.unlink()
     if out.exists() and any(out.iterdir()) and not cfg.resume and not cfg.force: raise ValueError("output-dir is non-empty; use --resume, --force, or a unique path")
@@ -548,17 +600,10 @@ def run(cfg):
         splits,split_meta=dirichlet_split(labels,cfg.num_clients,cfg.alpha,cfg.min_samples_per_client,cfg.seed,cfg.protocol=="canonical",return_stats=True,samples_per_client=samples)
         pstats={**partition_stats(labels,splits),**split_meta}; pstats["repair_warning"]=pstats["repaired_sample_fraction"]>cfg.repair_warning_fraction
         pstats["total_used_samples"]=sum(map(len,splits)); pstats["unused_samples"]=len(labels)-pstats["total_used_samples"]
-        states=initial_states(cfg.num_clients,cfg.seed); graph=initial_graph(cfg); start=0; records=[]; rep_history=[]
-        pac_state=None; initial_pac=None
-        if cfg.method in PAC_METHODS:
-            # All workshop PAC methods start from the same sparse topology
-            # family. LFHE-Expand alone retains the historical PAC-v2 capacity
-            # headroom instead of locking the budget to the initial edge count.
-            pac_average_degree=min(3,cfg.dmax)
-            pac_edge_budget=None if cfg.method=="lfhe_expand" else round(cfg.num_clients*pac_average_degree/2)
-            pac_state=build_random_heterogeneous_state(num_nodes=cfg.num_clients,average_degree=pac_average_degree,dmax=cfg.dmax,seed=cfg.seed,edge_budget=pac_edge_budget)
-            if cfg.method in FIXED_EDGE_SWAP_METHODS: pac_state.enforce_fixed_edge_count()
-            graph=pac_state.graph
+        states=initial_states(cfg.num_clients,cfg.seed)
+        graph,pac_state,common_initial=initialize_topology(cfg)
+        start=0; records=[]; rep_history=[]; initial_pac=None
+        if pac_state is not None:
             initial_pac={"topology_hash":pac_state.topology_hash,"protected_hash":pac_state.protected_hash,"protected_edges":pac_state.protected_edges}
         diss=[]; morph_nodes=[]
         if cfg.method=="dissdl":
@@ -569,7 +614,10 @@ def run(cfg):
                 for i,node in enumerate(diss): directed.add_edges_from((j,i) for j in node.wanted_senders)
                 graph=directed
         if cfg.method=="morph": morph_nodes=make_morph_nodes(states,graph,cfg)
-        initial=graph_stats(graph); initial["over_cap_nodes"]=sum(d>cfg.dmax for _,d in graph.degree())
+        initial=graph_stats(graph); initial["over_cap_nodes"]=degree_cap_violations(graph,cfg.dmax)
+        if common_initial is not None:
+            initial["common_topology_hash"]=undirected_topology_hash(common_initial)
+            initial["common_edge_count"]=common_initial.number_of_edges()
         if cfg.method in PAC_METHODS: initial.update({"topology_hash":pac_state.topology_hash,"protected_tree_hash":pac_state.protected_hash,"edge_budget":pac_state.edge_budget})
         representation_shape=list(states[0]["classifier.4.weight"].shape)
         representation_dimension=(
@@ -577,10 +625,12 @@ def run(cfg):
             if cfg.method in FIXED_EDGE_SWAP_METHODS
             else (representation_shape[0] if cfg.representation_mode=="class_mean" else int(states[0]["classifier.4.weight"].numel()))
         )
-        resolved_initial="dissdl_random_in_degree_3" if cfg.protocol=="canonical" and cfg.method=="dissdl" else "epidemic_directed_degree_4" if cfg.protocol=="canonical" and cfg.method=="epidemic" else cfg.initial_graph
+        resolved_initial="shared_static_bounded_connected" if common_initial is not None else "dissdl_random_in_degree_3" if cfg.protocol=="canonical" and cfg.method=="dissdl" else "epidemic_directed_degree_4" if cfg.protocol=="canonical" and cfg.method=="epidemic" else cfg.initial_graph
         write_edges(out/"graph_initial.edgelist",graph)
+        if common_initial is not None:
+            write_edges(out/"graph_initial_common.edgelist",common_initial)
         if cfg.method in PAC_METHODS: write_edge_set(out/"protected_edges_initial.edgelist",pac_state.protected_edges)
-        atomic_json(out/"config.json",{**asdict(cfg),"resolved_initial_graph":f"pac_expand_sparse_avgdeg{pac_average_degree}" if cfg.method=="lfhe_expand" else f"pac_fixed_edge_avgdeg{min(3,cfg.dmax)}" if cfg.method in PAC_METHODS else resolved_initial,"experiment_id":config_hash(cfg),"deployment_protocol":"partial_participation" if cfg.participation_rate<1 else "full_participation","representation_shape":representation_shape,"representation_dimension":representation_dimension,"representation_mode":cfg.representation_mode,"lfhe_start_round":cfg.lfhe_start_round,"first_topology_update_round":0,"method_label":"LFHE-Expand" if cfg.method=="lfhe_expand" else cfg.method,"protocol_version":"lfhe_pac_v2_initiator_only" if cfg.method=="lfhe_expand" else "fixed_edge_pac_v1" if cfg.method in FIXED_EDGE_SWAP_METHODS else None,"fixed_edge":cfg.method in FIXED_EDGE_SWAP_METHODS,"swap_only":cfg.method in FIXED_EDGE_SWAP_METHODS,"initial_edge_count":graph.number_of_edges(),"edge_capacity":pac_state.edge_budget if cfg.method in PAC_METHODS else None})
+        atomic_json(out/"config.json",{**asdict(cfg),"resolved_initial_graph":resolved_initial if common_initial is not None else f"pac_expand_sparse_avgdeg{min(3,cfg.dmax)}" if cfg.method=="lfhe_expand" else f"pac_fixed_edge_avgdeg{min(3,cfg.dmax)}" if cfg.method in PAC_METHODS else resolved_initial,"initial_common_topology_hash":undirected_topology_hash(common_initial) if common_initial is not None else None,"initial_common_edge_count":common_initial.number_of_edges() if common_initial is not None else None,"experiment_id":config_hash(cfg),"deployment_protocol":"partial_participation" if cfg.participation_rate<1 else "full_participation","representation_shape":representation_shape,"representation_dimension":representation_dimension,"representation_mode":cfg.representation_mode,"lfhe_start_round":cfg.lfhe_start_round,"first_topology_update_round":0,"method_label":"LFHE-Expand" if cfg.method=="lfhe_expand" else cfg.method,"protocol_version":"lfhe_pac_v2_initiator_only" if cfg.method=="lfhe_expand" else "fixed_edge_pac_v1" if cfg.method in FIXED_EDGE_SWAP_METHODS else None,"fixed_edge":cfg.method in FIXED_EDGE_SWAP_METHODS,"swap_only":cfg.method in FIXED_EDGE_SWAP_METHODS,"initial_edge_count":graph.number_of_edges(),"edge_capacity":pac_state.edge_budget if cfg.method in PAC_METHODS else None})
         print(f"[representation] shape={tuple(states[0]['classifier.4.weight'].shape)} flattened_dimension={representation_dimension}",flush=True)
     fixed_eval=random.Random(cfg.seed+991).sample(range(cfg.num_clients),min(cfg.eval_clients,cfg.num_clients))
     # The reusable execution model must not perturb training/dropout RNG state.
@@ -608,7 +658,10 @@ def run(cfg):
         t=time.perf_counter()
         aggregation_graph,dropped_links=failed_link_view(graph,cfg.link_failure_rate,cfg.seed*10_000_019+rnd)
         if cfg.method=="fedavg": tx=fedavg(states,active)
-        elif cfg.method=="epidemic": graph=build_epidemic_graph(cfg.num_clients,cfg.dmax,cfg.seed+rnd); aggregation_graph,dropped_links=failed_link_view(graph,cfg.link_failure_rate,cfg.seed*10_000_019+rnd); tx=epidemic_aggregate(states,aggregation_graph,active)
+        elif cfg.method=="epidemic":
+            graph=epidemic_graph_for_round(cfg,graph,rnd)
+            aggregation_graph,dropped_links=failed_link_view(graph,cfg.link_failure_rate,cfg.seed*10_000_019+rnd)
+            tx=epidemic_aggregate(states,aggregation_graph,active)
         elif cfg.method=="dissdl": tx=dissdl_aggregate(states,diss,active)
         elif cfg.method=="morph": graph,tx=morph_round(states,morph_nodes,active,rnd); aggregation_graph=graph
         else: tx=aggregate(states,aggregation_graph,active)
@@ -820,6 +873,8 @@ def parser():
     p.add_argument("--eval-clients",type=int,default=50); p.add_argument("--final-eval-all",dest="final_eval_all",action="store_true"); p.add_argument("--no-final-eval-all",dest="final_eval_all",action="store_false"); p.set_defaults(final_eval_all=True); p.add_argument("--data-root",default=os.getenv("LFHE_DATA_ROOT","./data")); p.add_argument("--update-mode",choices=("sequential","snapshot_concurrent"),default="sequential")
     p.add_argument("--data-regime",choices=("fixed_total","fixed_per_client","fixed_samples_per_client"),default="fixed_total"); p.add_argument("--samples-per-client",type=int)
     p.add_argument("--degree-regime",choices=("ordinary","fixed2","fixed4","fixed8","log2"),default="ordinary")
+    p.add_argument("--shared-initial-topology",action=argparse.BooleanOptionalAction,default=False,
+                   help="Start every method from the Static-Random bounded-connected graph")
     p.add_argument("--checkpoint-policy",dest="checkpoint_policy_override",choices=("auto","full","disabled"),default="auto")
     p.add_argument("--link-failure-rate",type=float,default=0.); p.add_argument("--stale-view-rounds",type=int,default=0); p.add_argument("--repair-warning-fraction",type=float,default=.05)
     p.add_argument("--min-samples-per-client",type=int); p.add_argument("--representation-mode",choices=("flatten","class_mean"),default="flatten"); p.add_argument("--lfhe-start-round",type=int,default=0); p.add_argument("--target-accuracy",type=float,default=.65); p.add_argument("--graph-metric-interval",type=int,default=25); p.add_argument("--dissdl-max-n",type=int,default=500); p.add_argument("--num-workers",type=int,default=0); return p
@@ -835,6 +890,8 @@ def make_config(a):
     if not 0<=a.link_failure_rate<1: raise ValueError("link-failure-rate must be in [0,1)")
     if a.stale_view_rounds<0: raise ValueError("stale-view-rounds must be >=0")
     if a.lfhe_start_round<0: raise ValueError("lfhe-start-round must be >=0")
+    if a.shared_initial_topology and (canonical or initial!="bounded_connected"):
+        raise ValueError("shared initial topology requires scalable bounded_connected")
     if a.data_regime in ("fixed_per_client","fixed_samples_per_client") and (a.samples_per_client is None or a.samples_per_client<1): raise ValueError("fixed samples per client requires --samples-per-client")
     if a.samples_per_client is not None and a.samples_per_client*a.num_clients>50000: raise ValueError("requested fixed-per-client data exceeds CIFAR-10 training set")
     if canonical and a.participation_rate!=1: raise ValueError("canonical protocol requires full participation")
@@ -846,7 +903,7 @@ def make_config(a):
         raise ValueError(f"Morph requires morph.py exposing MorphNode: {MORPH_IMPORT_ERROR}")
     if a.method=="dissdl" and a.num_clients>a.dissdl_max_n: raise ValueError("DissDL disabled above --dissdl-max-n due to its all-client known-peer directory")
     if a.method=="fedavg" and initial=="bounded_connected": initial="canonical_er"
-    return Config(a.method,a.num_clients,a.seed,rounds,a.protocol,a.alpha,a.dmax,dmax,topo,ev,initial,a.participation_rate,epochs,steps,batch,a.lr,a.output_dir,a.checkpoint_interval,a.checkpoint_path,a.resume,a.force,a.eval_clients,a.final_eval_all,a.data_root,a.update_mode,minimum,a.target_accuracy,a.graph_metric_interval,a.dissdl_max_n,a.num_workers,a.samples_per_client,a.link_failure_rate,a.stale_view_rounds,a.repair_warning_fraction,a.representation_mode,a.lfhe_start_round,data_regime=a.data_regime,degree_regime=a.degree_regime,checkpoint_policy_override=a.checkpoint_policy_override)
+    return Config(a.method,a.num_clients,a.seed,rounds,a.protocol,a.alpha,a.dmax,dmax,topo,ev,initial,a.participation_rate,epochs,steps,batch,a.lr,a.output_dir,a.checkpoint_interval,a.checkpoint_path,a.resume,a.force,a.eval_clients,a.final_eval_all,a.data_root,a.update_mode,minimum,a.target_accuracy,a.graph_metric_interval,a.dissdl_max_n,a.num_workers,a.samples_per_client,a.link_failure_rate,a.stale_view_rounds,a.repair_warning_fraction,a.representation_mode,a.lfhe_start_round,data_regime=a.data_regime,degree_regime=a.degree_regime,checkpoint_policy_override=a.checkpoint_policy_override,shared_initial_topology=a.shared_initial_topology)
 
 def main():
     try:

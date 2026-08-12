@@ -53,6 +53,23 @@ python scripts/build_topology_animation.py \
 The builder is read-only with respect to experiment outputs and tolerates a
 partially appended final JSONL line, so it can also be run while jobs execute.
 
+## Shared Static-Random initial topology main suite
+
+`manifests/workshop_main_shared_static_init_n50_500.csv` is the clean 120-run
+N={50,100,200,500}, seeds 42--46 main comparison. Every row enables
+`--shared-initial-topology`: the common undirected graph is exactly
+`bounded_connected(N,Dmax,seed)`, the same graph used by Static Random.
+Directed methods store the same neighbor set as bidirectional sender links,
+and PAC methods wrap the exact edge set in their protected-tree transaction
+state. Each run records `graph_initial_common.edgelist` and
+`initial_common_topology_hash`.
+
+Submit at most four concurrent Turing jobs from the NCC checkout root:
+
+```bash
+sbatch --array=0-119%4 slurm/run_shared_initial_main_ncc.sbatch
+```
+
 ## Completion and resume
 
 - `SUCCESS` means the run completed.

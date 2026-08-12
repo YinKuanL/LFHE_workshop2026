@@ -4,7 +4,8 @@ from pathlib import Path
 import networkx as nx
 import numpy as np
 
-from lfhe_pac import (LFHEPACState, build_random_heterogeneous_state,
+from lfhe_pac import (LFHEPACState, build_pac_state_from_graph,
+    build_random_heterogeneous_state,
     discover_frozen_fof, enumerate_feasible_operations, feasible_operation_hash,
     graph_jaccard_swap_score, representation_swap_score, run_pac_epoch,
     select_one_proposal_per_initiator)
@@ -22,6 +23,14 @@ def test_n50_initial_graph_and_protected_tree():
     value=state(); graph=value.graph; protected=nx.Graph(); protected.add_nodes_from(graph); protected.add_edges_from(value.protected_edges)
     assert graph.number_of_edges()==75 and nx.is_connected(graph) and max(dict(graph.degree()).values())<=4
     assert nx.is_tree(protected) and len(set(dict(graph.degree()).values()))>1 and value.edge_budget==75
+
+
+def test_pac_state_can_reuse_the_exact_static_random_graph():
+    graph=nx.cycle_graph(12)
+    graph.add_edges_from((i,i+6) for i in range(6))
+    value=build_pac_state_from_graph(graph,dmax=3,seed=42,edge_budget=18)
+    assert set(map(frozenset,value.graph.edges()))==set(map(frozenset,graph.edges()))
+    assert value.edge_budget==18 and nx.is_tree(nx.Graph(list(value.protected_edges)))
 
 def test_frozen_candidate_and_feasible_order_invariance():
     value=state(); snap=snapshot(value); forward=list(range(50)); reverse=forward[::-1]

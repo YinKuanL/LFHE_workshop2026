@@ -265,6 +265,39 @@ def _deterministic_spanning_tree(graph: nx.Graph, seed: int) -> frozenset[Edge]:
     return frozenset(canonical_edge(edge) for edge in tree.edges())
 
 
+def build_pac_state_from_graph(
+    graph: nx.Graph,
+    *,
+    dmax: int,
+    seed: int,
+    edge_budget: int | None = None,
+) -> LFHEPACState:
+    """Wrap an existing connected capped graph in the PAC transaction state."""
+
+    if graph.is_directed() or nx.number_of_selfloops(graph):
+        raise ValueError("PAC initial graph must be a simple undirected graph")
+    nodes = sorted(int(node) for node in graph.nodes())
+    if nodes != list(range(len(nodes))):
+        raise ValueError("PAC initial graph nodes must be contiguous from zero")
+    if not nx.is_connected(graph):
+        raise ValueError("PAC initial graph must be connected")
+    if max(dict(graph.degree()).values(), default=0) > int(dmax):
+        raise ValueError("PAC initial graph exceeds Dmax")
+    edges = frozenset(canonical_edge(edge) for edge in graph.edges())
+    capacity = len(nodes) * int(dmax) // 2
+    budget = capacity if edge_budget is None else int(edge_budget)
+    if not len(edges) <= budget <= capacity:
+        raise ValueError("PAC edge budget must cover the graph and respect Dmax capacity")
+    protected = _deterministic_spanning_tree(graph, int(seed))
+    return LFHEPACState(
+        num_nodes=len(nodes),
+        protected_edges=protected,
+        adaptive_edges=edges - protected,
+        dmax=int(dmax),
+        edge_budget=budget,
+    )
+
+
 def build_random_heterogeneous_state(
     *,
     num_nodes: int,

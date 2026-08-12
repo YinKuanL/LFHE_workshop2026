@@ -25,6 +25,7 @@ def main():
         if r.get(key,"")!="": cmd += [flag,r[key]]
     if r["final_eval_all"].lower()=="true": cmd.append("--final-eval-all")
     else: cmd.append("--no-final-eval-all")
+    if r.get("shared_initial_topology","false").lower()=="true": cmd.append("--shared-initial-topology")
     if r["samples_per_client"]: cmd += ["--samples-per-client",r["samples_per_client"]]
     if r["min_samples_per_client"]: cmd += ["--min-samples-per-client",r["min_samples_per_client"]]
     if r.get("checkpoint_policy","auto")!="disabled" and (out/"checkpoint.pt").exists(): cmd.append("--resume")
