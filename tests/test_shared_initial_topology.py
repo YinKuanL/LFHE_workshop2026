@@ -9,7 +9,10 @@ import main
 
 
 ROOT = Path(__file__).resolve().parents[1]
-METHODS = ("static_random", "epidemic", "dissdl", "random_fof", "morph", "lfhe")
+METHODS = (
+    "static_random", "epidemic", "dissdl", "random_fof", "morph", "lfhe",
+    "lfhe_expand",
+)
 
 
 def config(method: str, n: int = 50, seed: int = 42):
@@ -61,6 +64,11 @@ def test_every_main_method_has_the_exact_static_random_initial_topology():
                     assert pac_state is not None
                     assert pac_state.edge_count == len(expected)
                     assert pac_state.fixed_edge_count == len(expected)
+                if method == "lfhe_expand":
+                    assert pac_state is not None
+                    assert pac_state.edge_count == len(expected)
+                    assert pac_state.edge_budget == n * 4 // 2
+                    assert pac_state.fixed_edge_count is None
             assert len(hashes) == 1
 
 

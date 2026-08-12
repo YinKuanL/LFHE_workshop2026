@@ -166,6 +166,20 @@ def test_lfhe_expand_manifest_and_smoke_contracts():
     assert smoke[0]['method']=='lfhe_expand' and smoke[0]['num_clients']=='100'
 
 
+def test_lfhe_expand_shared_static_manifest_contract():
+    rows=list(csv.DictReader(
+        (ROOT/'manifests/workshop_lfhe_expand_n100_shared_static.csv').open()
+    ))
+    assert len(rows)==5 and {int(r['seed']) for r in rows}==set(range(42,47))
+    assert len({r['output_dir'] for r in rows})==5
+    assert all(r['method']=='lfhe_expand' for r in rows)
+    assert all(r['shared_initial_topology']=='true' for r in rows)
+    assert all(r['initial_graph']=='bounded_connected' for r in rows)
+    assert all(r['output_dir'].startswith(
+        'outputs/workshop_lfhe_expand_n100_shared_static/'
+    ) for r in rows)
+
+
 def test_md_lfhe_seed41_rerun_manifest_contract():
     rows=list(csv.DictReader((ROOT/'manifests/workshop_lfhe_md_swap_n100_seed41.csv').open()))
     assert len(rows)==1
