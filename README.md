@@ -37,6 +37,22 @@ Core contains 194 runs. All contains 413 runs and deliberately reuses the same o
 
 Each array task passes its zero-based `SLURM_ARRAY_TASK_ID` to `run_manifest_row.py`. `csv.DictReader` removes the header, so Core indices `0-193` select all 194 data rows and All indices `0-412` select all 413 data rows without skipping the first experiment or reading the header.
 
+## Interactive topology evolution
+
+PAC runs record an initial edge list and per-update edge deltas. Build a
+self-contained viewer that can select method, client count, and seed, then
+play or scrub the exact topology evolution:
+
+```bash
+python scripts/build_topology_animation.py \
+  --outputs outputs/workshop_main_remaining_md_aligned_n50_500 \
+  --methods random_fof lfhe \
+  --output reports/topology_evolution.html
+```
+
+The builder is read-only with respect to experiment outputs and tolerates a
+partially appended final JSONL line, so it can also be run while jobs execute.
+
 ## Completion and resume
 
 - `SUCCESS` means the run completed.
