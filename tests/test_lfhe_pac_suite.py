@@ -156,6 +156,18 @@ def test_lfhe_expand_manifest_and_smoke_contracts():
     assert len(smoke)==1 and smoke[0]['seed']=='42' and smoke[0]['rounds']=='10'
     assert smoke[0]['method']=='lfhe_expand' and smoke[0]['num_clients']=='100'
 
+
+def test_md_lfhe_seed41_rerun_manifest_contract():
+    rows=list(csv.DictReader((ROOT/'manifests/workshop_lfhe_md_swap_n100_seed41.csv').open()))
+    assert len(rows)==1
+    row=rows[0]
+    assert (row['method'],row['num_clients'],row['seed'],row['rounds'])==('lfhe','100','41','300')
+    assert (row['alpha'],row['dmax'],row['degree_regime'])==('0.3','4','fixed4')
+    assert (row['topology_interval'],row['eval_interval'])==('5','5')
+    assert row['initial_graph']=='bounded_connected' and row['representation_mode']=='flatten'
+    assert row['local_epochs']=='1' and row['data_regime']=='fixed_total'
+    assert 'md_aligned' in row['output_dir'] and 'lfhe_expand' not in row['output_dir']
+
 def test_runner_schema_is_wired():
     source=(ROOT/'main.py').read_text()
     for field in ('pac_candidate_packets.jsonl','pac_proposals.jsonl','pac_epoch_summary.jsonl','candidate_stream_hash','all_pac_invariants_passed','protected_tree_unchanged'):
