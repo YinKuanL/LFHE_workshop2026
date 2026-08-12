@@ -732,6 +732,9 @@ def _pac_priority(proposal: LFHEPACProposal) -> tuple[float, float, str]:
 def _canonical_method(method: str) -> str:
     aliases = {
         "lfhe_pac_initiator_only": "lfhe_pac_v2",
+        # Workshop-only name for the historical add-or-one-edge-swap method.
+        # Keep this alias separate from the final fixed-edge LFHE.
+        "lfhe_expand": "lfhe_pac_v2",
         "lfhe_pac": "lfhe_pac_strict",
     }
     return aliases.get(method, method)

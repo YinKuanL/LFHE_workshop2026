@@ -19,6 +19,7 @@ from lfhe_pac import (LFHEPACState, build_random_heterogeneous_state,
     discover_frozen_fof, enumerate_feasible_operations, feasible_operation_hash,
     proposal_log_rows, representation_swap_score, run_pac_epoch,
     select_one_proposal_per_initiator)
+from pac_methods import FIXED_EDGE_SWAP_METHODS, PAC_METHODS, PAC_PROTOCOL_METHOD
 
 try:
     from morph import MorphNode
@@ -29,14 +30,7 @@ except ImportError as exc:
 
 EXIT_REQUEUE = 99
 STOP_SIGNAL = None
-METHODS = ("ring", "static_random", "epidemic", "dissdl", "random_fof", "morph", "lfhe", "lfhe_pac", "fedavg")
-PAC_METHODS = frozenset({"random_fof", "lfhe", "lfhe_pac"})
-FIXED_EDGE_SWAP_METHODS = frozenset({"random_fof", "lfhe"})
-PAC_PROTOCOL_METHOD = {
-    "random_fof": "random_fof_swap",
-    "lfhe": "lfhe_representation_swap",
-    "lfhe_pac": "lfhe_pac_strict",
-}
+METHODS = ("ring", "static_random", "epidemic", "dissdl", "random_fof", "morph", "lfhe", "lfhe_expand", "lfhe_pac", "fedavg")
 
 def _stop(signum, _frame):
     global STOP_SIGNAL
@@ -496,12 +490,12 @@ def summarize(cfg, records, started, pstats, initial, final, deployment, checkpo
     result={"experiment_id":config_hash(cfg),"status":"complete","protocol":cfg.protocol,"deployment_protocol":deployment,
       "final_accuracy":ys[-1] if ys else None,"normalized_auc":auc,"rounds_to_target":reached["round"] if reached else None,
       "bytes_to_target":reached["cumulative_bytes"] if reached else None,"wall_clock_time_to_target":reached["elapsed_seconds"] if reached else None,
-      "partition":pstats,"initial_graph":initial,"final_graph":final,"wall_clock_seconds":time.time()-started,
+      "partition":pstats,"initial_graph":initial,"final_graph":final,"initial_edge_count":initial["edges"],"current_edge_count":final["edges"],"final_edge_count":final["edges"],"wall_clock_seconds":time.time()-started,
       "evaluations":len(evals),"rounds_completed":cfg.rounds,"checkpoint_policy":policy,"checkpoint_disabled_reason":disabled_reason,"resumable":resumable,"last_accepted_rewire_round":accepted[-1] if accepted else None,
       "topology_stabilization_round":(accepted[-1]+1) if accepted else 0,
       "resource_projection":{"mean_round_seconds":mean_round,"projected_300_round_seconds":projected,"peak_cpu_rss_bytes":peak_rss,"peak_gpu_reserved_bytes":peak_gpu,"checkpoint_bytes":checkpoint_bytes,"max_checkpoint_seconds":checkpoint_seconds,"final_full_evaluation_seconds":final_eval},
       "feasibility_gate":{"passed":all(gate_checks.values()),"checks":gate_checks},
-      "scientific_notes":["fixed-edge representation-novelty swap" if cfg.method=="lfhe" else "fixed-edge score-free FoF swap" if cfg.method=="random_fof" else "real Morph topology implementation" if cfg.method=="morph" else "matched baseline budget"]}
+      "scientific_notes":["fixed-edge representation-novelty swap" if cfg.method=="lfhe" else "historical LFHE-PAC v2 add-or-one-edge-swap (workshop LFHE-Expand)" if cfg.method=="lfhe_expand" else "fixed-edge score-free FoF swap" if cfg.method=="random_fof" else "real Morph topology implementation" if cfg.method=="morph" else "matched baseline budget"]}
     if cfg.method in PAC_METHODS:
         epochs=[r["pac_epoch"] for r in records if "pac_epoch" in r]; selected=sum(e["selected_proposals"] for e in epochs); committed=sum(e["total_committed_transactions"] for e in epochs)
         responses=sum(e["endpoint_responses"] for e in epochs); approvals=sum(e["endpoint_approvals"] for e in epochs)
@@ -551,8 +545,12 @@ def run(cfg):
         states=initial_states(cfg.num_clients,cfg.seed); graph=initial_graph(cfg); start=0; records=[]; rep_history=[]
         pac_state=None; initial_pac=None
         if cfg.method in PAC_METHODS:
+            # All workshop PAC methods start from the same sparse topology
+            # family. LFHE-Expand alone retains the historical PAC-v2 capacity
+            # headroom instead of locking the budget to the initial edge count.
             pac_average_degree=min(3,cfg.dmax)
-            pac_state=build_random_heterogeneous_state(num_nodes=cfg.num_clients,average_degree=pac_average_degree,dmax=cfg.dmax,seed=cfg.seed,edge_budget=round(cfg.num_clients*pac_average_degree/2))
+            pac_edge_budget=None if cfg.method=="lfhe_expand" else round(cfg.num_clients*pac_average_degree/2)
+            pac_state=build_random_heterogeneous_state(num_nodes=cfg.num_clients,average_degree=pac_average_degree,dmax=cfg.dmax,seed=cfg.seed,edge_budget=pac_edge_budget)
             graph=pac_state.graph
             initial_pac={"topology_hash":pac_state.topology_hash,"protected_hash":pac_state.protected_hash,"protected_edges":pac_state.protected_edges}
         diss=[]; morph_nodes=[]
@@ -571,7 +569,7 @@ def run(cfg):
         resolved_initial="dissdl_random_in_degree_3" if cfg.protocol=="canonical" and cfg.method=="dissdl" else "epidemic_directed_degree_4" if cfg.protocol=="canonical" and cfg.method=="epidemic" else cfg.initial_graph
         write_edges(out/"graph_initial.edgelist",graph)
         if cfg.method in PAC_METHODS: write_edge_set(out/"protected_edges_initial.edgelist",pac_state.protected_edges)
-        atomic_json(out/"config.json",{**asdict(cfg),"resolved_initial_graph":f"pac_fixed_edge_avgdeg{min(3,cfg.dmax)}" if cfg.method in PAC_METHODS else resolved_initial,"experiment_id":config_hash(cfg),"deployment_protocol":"partial_participation" if cfg.participation_rate<1 else "full_participation","representation_shape":representation_shape,"representation_dimension":representation_dimension,"representation_mode":cfg.representation_mode,"lfhe_start_round":cfg.lfhe_start_round,"first_topology_update_round":0})
+        atomic_json(out/"config.json",{**asdict(cfg),"resolved_initial_graph":f"pac_expand_sparse_avgdeg{pac_average_degree}" if cfg.method=="lfhe_expand" else f"pac_fixed_edge_avgdeg{min(3,cfg.dmax)}" if cfg.method in PAC_METHODS else resolved_initial,"experiment_id":config_hash(cfg),"deployment_protocol":"partial_participation" if cfg.participation_rate<1 else "full_participation","representation_shape":representation_shape,"representation_dimension":representation_dimension,"representation_mode":cfg.representation_mode,"lfhe_start_round":cfg.lfhe_start_round,"first_topology_update_round":0,"method_label":"LFHE-Expand" if cfg.method=="lfhe_expand" else cfg.method,"protocol_version":"lfhe_pac_v2_initiator_only" if cfg.method=="lfhe_expand" else "fixed_edge_pac_v1" if cfg.method in FIXED_EDGE_SWAP_METHODS else None,"fixed_edge":cfg.method in FIXED_EDGE_SWAP_METHODS,"swap_only":cfg.method in FIXED_EDGE_SWAP_METHODS,"initial_edge_count":graph.number_of_edges(),"edge_capacity":pac_state.edge_budget if cfg.method in PAC_METHODS else None})
         print(f"[representation] shape={tuple(states[0]['classifier.4.weight'].shape)} flattened_dimension={representation_dimension}",flush=True)
     fixed_eval=random.Random(cfg.seed+991).sample(range(cfg.num_clients),min(cfg.eval_clients,cfg.num_clients))
     # The reusable execution model must not perturb training/dropout RNG state.
@@ -626,7 +624,7 @@ def run(cfg):
                 for row in proposal_log_rows(selected,result): append_jsonl(out/"pac_proposals.jsonl",{"round":rnd,**row})
                 after_edges=set(graph.edges()); append_jsonl(out/"pac_edge_deltas.jsonl",{"round":rnd,"added":sorted(after_edges-before_edges),"removed":sorted(before_edges-after_edges),"topology_hash":pac_state.topology_hash})
                 veto=dict(result.endpoint_vetoes); reasons=[o.reason for o in result.outcomes]
-                score_passing=len(feasible) if cfg.method=="random_fof" else sum(p.initiator_gain>0 for p in feasible) if cfg.method=="lfhe" else sum(p.initiator_gain>0 and p.minimum_gain>=0 for p in feasible)
+                score_passing=len(feasible) if cfg.method=="random_fof" else sum(p.initiator_gain>0 for p in feasible) if cfg.method in {"lfhe", "lfhe_expand"} else sum(p.initiator_gain>0 and p.minimum_gain>=0 for p in feasible)
                 pac_epoch={"round":rnd,"candidate_packets":len(stream.packets),"unique_fof_candidates":len({(p.initiator,p.candidate) for p in stream.packets}),
                   "feasible_additions":sum(p.operation=="addition" for p in feasible),"feasible_swaps":sum(p.operation=="swap" for p in feasible),
                   "score_passing_proposals":score_passing,"selected_proposals":len(selected),
@@ -644,7 +642,7 @@ def run(cfg):
         effective_components=nx.number_connected_components(aggregation_graph.to_undirected()); effective_connected=effective_components==1
         prior_disconnect_streak=disconnect_streak; disconnect_streak=0 if effective_connected else disconnect_streak+1
         recovery_rounds=prior_disconnect_streak if effective_connected and not previous_effective_connected else None
-        rec={"round":rnd,"active_clients":len(active),"model_transmissions":tx,"active_links":graph.number_of_edges(),"model_bytes":tx*model_bytes,
+        rec={"round":rnd,"active_clients":len(active),"model_transmissions":tx,"active_links":graph.number_of_edges(),"current_edge_count":graph.number_of_edges(),"model_bytes":tx*model_bytes,
              "topology_control_messages":control,"topology_control_bytes":control_bytes,"cumulative_bytes":cumulative,"local_training_seconds":train_s,
              "aggregation_seconds":agg_s,"topology_update_seconds":topo_s,"candidate_checks":control,
              "link_failure_rate":cfg.link_failure_rate,"failed_links":dropped_links,"effective_connected_components":effective_components,"effective_connected":effective_connected,"recovered_this_round":effective_connected and not previous_effective_connected,"recovery_rounds":recovery_rounds,
