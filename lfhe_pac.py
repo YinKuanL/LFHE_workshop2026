@@ -39,6 +39,7 @@ class LFHEPACSnapshot:
     adaptive_edges: frozenset[Edge]
     dmax: int
     edge_budget: int
+    fixed_edge_count: int | None
     versions: tuple[tuple[int, int], ...]
     representations: tuple[tuple[int, np.ndarray], ...]
     representation_timestamp: int
@@ -65,6 +66,7 @@ class LFHEPACSnapshot:
                 "adaptive": _edge_payload(self.adaptive_edges),
                 "dmax": self.dmax,
                 "edge_budget": self.edge_budget,
+                "fixed_edge_count": self.fixed_edge_count,
             }
         )
 
@@ -93,12 +95,16 @@ class LFHEPACState:
         adaptive_edges: Iterable[Edge],
         dmax: int,
         edge_budget: int,
+        fixed_edge_count: int | None = None,
     ) -> None:
         self.num_nodes = int(num_nodes)
         self.protected_edges = frozenset(canonical_edge(e) for e in protected_edges)
         self.adaptive_edges = frozenset(canonical_edge(e) for e in adaptive_edges)
         self.dmax = int(dmax)
         self.edge_budget = int(edge_budget)
+        self.fixed_edge_count = (
+            None if fixed_edge_count is None else int(fixed_edge_count)
+        )
         self.versions = {node: 0 for node in range(self.num_nodes)}
         self.locks: dict[int, str] = {}
         self.validate()
@@ -123,6 +129,7 @@ class LFHEPACState:
                 "adaptive": _edge_payload(self.adaptive_edges),
                 "dmax": self.dmax,
                 "edge_budget": self.edge_budget,
+                "fixed_edge_count": self.fixed_edge_count,
             }
         )
 
@@ -137,6 +144,7 @@ class LFHEPACState:
             adaptive_edges=self.adaptive_edges,
             dmax=self.dmax,
             edge_budget=self.edge_budget,
+            fixed_edge_count=self.fixed_edge_count,
         )
         clone.versions = dict(self.versions)
         clone.locks = dict(self.locks)
@@ -167,8 +175,19 @@ class LFHEPACState:
             raise LFHEPACInvariantError("protected edges are not a spanning tree")
         if max(dict(graph.degree()).values(), default=0) > self.dmax:
             raise LFHEPACInvariantError("hard Dmax exceeded")
+        if self.fixed_edge_count is not None and graph.number_of_edges() != self.fixed_edge_count:
+            raise LFHEPACInvariantError("fixed edge count changed")
         if graph.number_of_edges() > self.edge_budget:
             raise LFHEPACInvariantError("edge budget exceeded")
+
+    def enforce_fixed_edge_count(self) -> None:
+        """Freeze the initialized edge count for a fixed-edge protocol."""
+
+        if self.fixed_edge_count is None:
+            self.fixed_edge_count = self.edge_count
+        if self.fixed_edge_count != self.edge_count:
+            raise LFHEPACInvariantError("fixed edge target differs from initial graph")
+        self.validate()
 
     def snapshot(
         self,
@@ -193,6 +212,7 @@ class LFHEPACState:
             adaptive_edges=self.adaptive_edges,
             dmax=self.dmax,
             edge_budget=self.edge_budget,
+            fixed_edge_count=self.fixed_edge_count,
             versions=tuple(sorted(self.versions.items())),
             representations=frozen,
             representation_timestamp=int(timestamp),
@@ -206,6 +226,7 @@ class LFHEPACState:
             "adaptive_edges": _edge_payload(self.adaptive_edges),
             "dmax": self.dmax,
             "edge_budget": self.edge_budget,
+            "fixed_edge_count": self.fixed_edge_count,
             "versions": dict(self.versions),
         }
 
@@ -217,6 +238,11 @@ class LFHEPACState:
             adaptive_edges=value["adaptive_edges"],
             dmax=int(value["dmax"]),
             edge_budget=int(value["edge_budget"]),
+            fixed_edge_count=(
+                None
+                if value.get("fixed_edge_count") is None
+                else int(value["fixed_edge_count"])
+            ),
         )
         state.versions = {
             int(endpoint): int(version)
@@ -645,6 +671,7 @@ def enumerate_feasible_operations(
     stream: FrozenFoFStream,
     *,
     initiator_order: Sequence[int] | None = None,
+    method: str | None = None,
     score_function: Callable[
         [int, nx.Graph, Mapping[int, np.ndarray]], float
     ] = normalized_structural_score,
@@ -653,6 +680,8 @@ def enumerate_feasible_operations(
         raise ValueError("candidate stream topology mismatch")
     if stream.representation_hash != snapshot.representation_hash:
         raise ValueError("candidate stream representation mismatch")
+    method = _canonical_method(method) if method is not None else None
+    fixed_edge_method = method in {"random_fof_swap", "lfhe_representation_swap"}
     graph = snapshot.graph
     order = list(range(snapshot.num_nodes)) if initiator_order is None else list(initiator_order)
     rank = {node: index for index, node in enumerate(order)}
@@ -664,7 +693,8 @@ def enumerate_feasible_operations(
         if i == k or graph.has_edge(i, k):
             continue
         if (
-            graph.degree(i) < snapshot.dmax
+            not fixed_edge_method
+            and graph.degree(i) < snapshot.dmax
             and graph.degree(k) < snapshot.dmax
             and graph.number_of_edges() < snapshot.edge_budget
         ):
@@ -827,7 +857,13 @@ def _topology_validation_reason(
     snapshot: LFHEPACSnapshot,
     proposal: LFHEPACProposal,
     endpoint: int,
+    method: str,
 ) -> str | None:
+    if method in {"random_fof_swap", "lfhe_representation_swap"}:
+        if proposal.operation != "swap" or proposal.old_edge is None:
+            return "fixed_edge_swap_required"
+        if state.fixed_edge_count is None:
+            return "missing_fixed_edge_target"
     if endpoint not in proposal.affected_endpoints:
         return "endpoint_not_affected"
     if proposal.representation_timestamp != snapshot.representation_timestamp:
@@ -910,10 +946,17 @@ def _endpoint_priority(
     return _pac_priority(proposal)
 
 
-def _atomic_apply(state: LFHEPACState, proposal: LFHEPACProposal) -> bool:
+def _atomic_apply(
+    state: LFHEPACState,
+    proposal: LFHEPACProposal,
+    *,
+    require_swap: bool = False,
+) -> bool:
     before = state.fingerprint()
     candidate = state.clone()
     try:
+        if require_swap and (proposal.operation != "swap" or proposal.old_edge is None):
+            raise LFHEPACInvariantError("fixed-edge protocol rejects additions")
         if any(
             candidate.versions[endpoint] != expected
             for endpoint, expected in proposal.expected_versions
@@ -949,7 +992,7 @@ def run_pac_epoch(
     proposals: Sequence[LFHEPACProposal],
     *,
     method: str,
-    max_commits: int,
+    max_commits: int | None = None,
     seed: int,
     force_timeout_txids: Iterable[str] = (),
     score_function: Callable[
@@ -964,6 +1007,16 @@ def run_pac_epoch(
         "lfhe_pac_strict", "lfhe_representation_swap",
     }:
         raise ValueError(f"unsupported PAC method: {method}")
+    fixed_edge_method = method in {"random_fof_swap", "lfhe_representation_swap"}
+    if fixed_edge_method:
+        state.enforce_fixed_edge_count()
+        snapshot_edge_target = (
+            snapshot.fixed_edge_count
+            if snapshot.fixed_edge_count is not None
+            else snapshot.graph.number_of_edges()
+        )
+        if snapshot_edge_target != state.fixed_edge_count:
+            raise LFHEPACInvariantError("snapshot/state fixed-edge target mismatch")
     timeouts = set(force_timeout_txids)
     inboxes: dict[int, list[LFHEPACProposal]] = {node: [] for node in range(state.num_nodes)}
     for proposal in proposals:
@@ -980,7 +1033,9 @@ def run_pac_epoch(
         valid: list[LFHEPACProposal] = []
         invalid_reasons: dict[str, str] = {}
         for proposal in touching:
-            reason = _topology_validation_reason(state, snapshot, proposal, endpoint)
+            reason = _topology_validation_reason(
+                state, snapshot, proposal, endpoint, method
+            )
             if reason is None:
                 reason = _score_validation_reason(
                     snapshot, proposal, endpoint, method, score_function
@@ -1058,11 +1113,11 @@ def run_pac_epoch(
     budget_rejections = 0
     already_recorded = {outcome.txid for outcome in outcomes}
     for index, proposal in enumerate(sorted(certified, key=lambda item: item.txid)):
-        if index >= max_commits:
+        if not fixed_edge_method and max_commits is not None and index >= max_commits:
             budget_rejections += 1
             outcomes.append(TransactionOutcome(proposal.txid, False, "commit_budget_exhausted"))
             continue
-        if _atomic_apply(state, proposal):
+        if _atomic_apply(state, proposal, require_swap=fixed_edge_method):
             if proposal.operation == "addition":
                 committed_additions += 1
             else:

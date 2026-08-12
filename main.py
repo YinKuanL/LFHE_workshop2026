@@ -264,14 +264,20 @@ def epidemic_aggregate(states,g,active):
     for i,s in updates.items(): states[i]=s
     return tx
 
+def topology_representation(state,mode="flatten"):
+    """Representation consumed by the MD-LFHE fixed-edge swap score."""
+    if not isinstance(state,dict): return state.flatten()
+    weight=state["classifier.4.weight"]
+    if mode=="class_mean": return weight.mean(dim=1).flatten()
+    bias=state.get("classifier.4.bias")
+    parts=[weight.flatten()]
+    if bias is not None: parts.append(bias.flatten())
+    return torch.cat(parts)
+
 class _RepresentationModel:
     def __init__(self,state,mode="flatten"):
-        self.weight=state["classifier.4.weight"] if isinstance(state,dict) else state
-        self.mode=mode
-    def get_representation(self):
-        if self.mode=="class_mean":
-            return self.weight.mean(dim=1).flatten()
-        return self.weight.flatten()
+        self.representation=topology_representation(state,mode)
+    def get_representation(self): return self.representation
 class Adapter:
     """Lightweight LFHE/Morph interface; does not allocate another CNN."""
     def __init__(self,state,mode="flatten"): self.model=_RepresentationModel(state,mode)
@@ -551,6 +557,7 @@ def run(cfg):
             pac_average_degree=min(3,cfg.dmax)
             pac_edge_budget=None if cfg.method=="lfhe_expand" else round(cfg.num_clients*pac_average_degree/2)
             pac_state=build_random_heterogeneous_state(num_nodes=cfg.num_clients,average_degree=pac_average_degree,dmax=cfg.dmax,seed=cfg.seed,edge_budget=pac_edge_budget)
+            if cfg.method in FIXED_EDGE_SWAP_METHODS: pac_state.enforce_fixed_edge_count()
             graph=pac_state.graph
             initial_pac={"topology_hash":pac_state.topology_hash,"protected_hash":pac_state.protected_hash,"protected_edges":pac_state.protected_edges}
         diss=[]; morph_nodes=[]
@@ -565,7 +572,11 @@ def run(cfg):
         initial=graph_stats(graph); initial["over_cap_nodes"]=sum(d>cfg.dmax for _,d in graph.degree())
         if cfg.method in PAC_METHODS: initial.update({"topology_hash":pac_state.topology_hash,"protected_tree_hash":pac_state.protected_hash,"edge_budget":pac_state.edge_budget})
         representation_shape=list(states[0]["classifier.4.weight"].shape)
-        representation_dimension=(representation_shape[0] if cfg.representation_mode=="class_mean" else int(states[0]["classifier.4.weight"].numel()))
+        representation_dimension=(
+            int(topology_representation(states[0],cfg.representation_mode).numel())
+            if cfg.method in FIXED_EDGE_SWAP_METHODS
+            else (representation_shape[0] if cfg.representation_mode=="class_mean" else int(states[0]["classifier.4.weight"].numel()))
+        )
         resolved_initial="dissdl_random_in_degree_3" if cfg.protocol=="canonical" and cfg.method=="dissdl" else "epidemic_directed_degree_4" if cfg.protocol=="canonical" and cfg.method=="epidemic" else cfg.initial_graph
         write_edges(out/"graph_initial.edgelist",graph)
         if cfg.method in PAC_METHODS: write_edge_set(out/"protected_edges_initial.edgelist",pac_state.protected_edges)
@@ -602,7 +613,10 @@ def run(cfg):
         elif cfg.method=="morph": graph,tx=morph_round(states,morph_nodes,active,rnd); aggregation_graph=graph
         else: tx=aggregate(states,aggregation_graph,active)
         agg_s=time.perf_counter()-t; topo_s=0.; trace=[]; concurrency={"proposal_count":0,"proposals_generated":0,"accepted_proposals":0,"rejected_proposals_concurrent":0,"endpoint_conflicts":0,"degree_conflicts":0,"stale_proposal_rejections":0,"connectivity_safeguard_rejections":0,"temporary_degree_violations":0,"final_degree_violations":0,"shared_endpoint_conflicts":0,"shared_endpoint_conflict_rate":0.,"stale_rejections":0,"degree_safety_rejections":0,"committed_proposals":0}
-        current_reps=torch.stack([s["classifier.4.weight"].clone() for s in states]); rep_history.append((rnd,current_reps)); rep_history=rep_history[-max(1,cfg.stale_view_rounds+1):]
+        current_reps=torch.stack([
+            (topology_representation(s,cfg.representation_mode) if cfg.method in FIXED_EDGE_SWAP_METHODS else s["classifier.4.weight"]).clone()
+            for s in states
+        ]); rep_history.append((rnd,current_reps)); rep_history=rep_history[-max(1,cfg.stale_view_rounds+1):]
         lfhe_window=(cfg.method not in PAC_METHODS or rnd>=cfg.lfhe_start_round)
         pac_epoch=None
         if cfg.method!="morph" and rnd%cfg.topology_interval==0 and lfhe_window:
@@ -611,15 +625,18 @@ def run(cfg):
             view_index=max(0,len(rep_history)-1-cfg.stale_view_rounds); view_round,view_reps=rep_history[view_index]; clients=[Adapter(view_reps[i],cfg.representation_mode) for i in range(cfg.num_clients)]
             if cfg.method=="dissdl": graph=dissdl_update(diss,states,active)
             elif cfg.method in PAC_METHODS:
-                before_edges=set(graph.edges()); representations={i:(view_reps[i].mean(dim=1) if cfg.representation_mode=="class_mean" else view_reps[i].flatten()).cpu().numpy() for i in range(cfg.num_clients)}
+                before_edges=set(graph.edges()); representations={
+                    i:(view_reps[i] if cfg.method in FIXED_EDGE_SWAP_METHODS else view_reps[i].mean(dim=1) if cfg.representation_mode=="class_mean" else view_reps[i].flatten()).cpu().numpy()
+                    for i in range(cfg.num_clients)
+                }
                 snapshot=pac_state.snapshot(representations,timestamp=rnd); stream=discover_frozen_fof(snapshot,candidate_budget=5,seed=cfg.seed)
                 protocol_method=PAC_PROTOCOL_METHOD[cfg.method]
                 score_function=representation_swap_score if cfg.method=="lfhe" else None
-                feasible=enumerate_feasible_operations(snapshot,stream,**({"score_function":score_function} if score_function else {}))
-                if cfg.method in FIXED_EDGE_SWAP_METHODS: feasible=tuple(proposal for proposal in feasible if proposal.operation=="swap")
+                feasible=enumerate_feasible_operations(snapshot,stream,method=protocol_method,**({"score_function":score_function} if score_function else {}))
                 selected=select_one_proposal_per_initiator(feasible,method=protocol_method,seed=cfg.seed)
                 forced_timeouts={proposal.txid for proposal in selected if any(endpoint not in active for endpoint in proposal.affected_endpoints) or int.from_bytes(hashlib.sha256(f"control|{cfg.seed}|{rnd}|{proposal.txid}".encode()).digest()[:8],"big")/2**64 < cfg.link_failure_rate}
-                result=run_pac_epoch(pac_state,snapshot,selected,method=protocol_method,max_commits=cfg.num_clients//4,seed=cfg.seed,force_timeout_txids=forced_timeouts,**({"score_function":score_function} if score_function else {})); graph=pac_state.graph
+                epoch_kwargs={} if cfg.method in FIXED_EDGE_SWAP_METHODS else {"max_commits":cfg.num_clients//4}
+                result=run_pac_epoch(pac_state,snapshot,selected,method=protocol_method,seed=cfg.seed,force_timeout_txids=forced_timeouts,**epoch_kwargs,**({"score_function":score_function} if score_function else {})); graph=pac_state.graph
                 for packet in stream.packets: append_jsonl(out/"pac_candidate_packets.jsonl",{"round":rnd,**packet.__dict__})
                 for row in proposal_log_rows(selected,result): append_jsonl(out/"pac_proposals.jsonl",{"round":rnd,**row})
                 after_edges=set(graph.edges()); append_jsonl(out/"pac_edge_deltas.jsonl",{"round":rnd,"added":sorted(after_edges-before_edges),"removed":sorted(before_edges-after_edges),"topology_hash":pac_state.topology_hash})

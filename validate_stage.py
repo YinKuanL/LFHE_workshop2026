@@ -14,7 +14,12 @@ def main():
         if a.kind=="canonical":
             expected=historical["methods"][row["method"]]; accuracy=summary.get("final_accuracy")
             if accuracy is None or not expected["min"]<=accuracy<=expected["max"]: failures.append(f"historical range failure: {out} accuracy={accuracy} expected={expected}")
-            if config.get("representation_dimension")!=historical["representation_dimension"] or config.get("representation_shape")!=historical["representation_shape"]: failures.append(f"representation mismatch: {out}")
+            expected_dimension=(
+                historical["representation_dimension"]+10
+                if row["method"] in {"lfhe","random_fof"}
+                else historical["representation_dimension"]
+            )
+            if config.get("representation_dimension")!=expected_dimension or config.get("representation_shape")!=historical["representation_shape"]: failures.append(f"representation mismatch: {out}")
             required={"protocol":"canonical","participation_rate":1.0,"dmax":4,"update_mode":"sequential","data_regime":"fixed_total"}
             for key,value in required.items():
                 if config.get(key)!=value: failures.append(f"canonical config mismatch {key}: {out}")

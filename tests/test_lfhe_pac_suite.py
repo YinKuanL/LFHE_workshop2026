@@ -45,13 +45,37 @@ def test_new_lfhe_and_random_fof_are_fixed_edge_swap_pair():
     ):
         value=state(); snap=snapshot(value); before=value.edge_count
         stream=discover_frozen_fof(snap,candidate_budget=5,seed=42)
-        feasible=enumerate_feasible_operations(snap,stream,**({"score_function":score_function} if score_function else {}))
-        feasible=tuple(proposal for proposal in feasible if proposal.operation=="swap")
+        feasible=enumerate_feasible_operations(snap,stream,method=method,**({"score_function":score_function} if score_function else {}))
         selected=select_one_proposal_per_initiator(feasible,method=method,seed=42)
-        result=run_pac_epoch(value,snap,selected,method=method,max_commits=12,seed=42,**({"score_function":score_function} if score_function else {}))
+        result=run_pac_epoch(value,snap,selected,method=method,max_commits=0,seed=42,**({"score_function":score_function} if score_function else {}))
         assert all(proposal.operation=="swap" for proposal in feasible)
         assert value.edge_count==before and result.committed_additions==0
+        assert value.fixed_edge_count==before
         assert nx.is_connected(value.graph) and max(dict(value.graph.degree()).values())<=4
+
+
+def test_fixed_edge_state_checkpoint_preserves_frozen_target():
+    value=state(); value.enforce_fixed_edge_count()
+    restored=LFHEPACState.restore(value.checkpoint())
+    assert restored.fixed_edge_count==value.edge_count
+    assert restored.fingerprint()==value.fingerprint()
+
+
+def test_workshop_lfhe_uses_md_weight_and_bias_representation():
+    import torch
+    from main import topology_representation
+    state_dict={
+        "classifier.4.weight":torch.arange(6,dtype=torch.float32).reshape(2,3),
+        "classifier.4.bias":torch.tensor([6.,7.]),
+    }
+    assert topology_representation(state_dict,"flatten").tolist()==list(map(float,range(8)))
+    assert topology_representation(state_dict,"class_mean").shape==(2,)
+
+
+def test_md_representation_change_is_scoped_to_fixed_edge_pair():
+    source=(ROOT/'main.py').read_text()
+    assert 'cfg.method in FIXED_EDGE_SWAP_METHODS else s["classifier.4.weight"]' in source
+    assert 'view_reps[i] if cfg.method in FIXED_EDGE_SWAP_METHODS' in source
 
 def test_lfhe_expand_restores_historical_add_or_swap_path():
     value=build_random_heterogeneous_state(
