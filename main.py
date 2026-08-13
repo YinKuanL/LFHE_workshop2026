@@ -672,6 +672,7 @@ def run(cfg):
         ]); rep_history.append((rnd,current_reps)); rep_history=rep_history[-max(1,cfg.stale_view_rounds+1):]
         lfhe_window=(cfg.method not in PAC_METHODS or rnd>=cfg.lfhe_start_round)
         pac_epoch=None
+        view_round=None
         if cfg.method!="morph" and rnd%cfg.topology_interval==0 and lfhe_window:
             t=time.perf_counter()
             component_id={node:index for index,component in enumerate(nx.connected_components(graph.to_undirected())) for node in component}
@@ -716,7 +717,7 @@ def run(cfg):
              "topology_control_messages":control,"topology_control_bytes":control_bytes,"cumulative_bytes":cumulative,"local_training_seconds":train_s,
              "aggregation_seconds":agg_s,"topology_update_seconds":topo_s,"candidate_checks":control,
              "link_failure_rate":cfg.link_failure_rate,"failed_links":dropped_links,"effective_connected_components":effective_components,"effective_connected":effective_connected,"recovered_this_round":effective_connected and not previous_effective_connected,"recovery_rounds":recovery_rounds,
-             "stale_view_rounds":cfg.stale_view_rounds,"representation_view_round":view_round if rnd%cfg.topology_interval==0 and lfhe_window else None,**concurrency,
+             "stale_view_rounds":cfg.stale_view_rounds,"representation_view_round":view_round,**concurrency,
              "fitness_evaluations":sum(e.get("fitness_evaluations",0) for e in trace),"accepted_additions":result.committed_additions if pac_epoch is not None else sum(e.get("action","").endswith("accepted_addition") for e in trace),
              "accepted_swaps":result.committed_swaps if pac_epoch is not None else sum(e.get("action","").endswith("accepted_swap") for e in trace),"rejected_proposals":len(selected)-result.committed_transactions if pac_epoch is not None else sum(e.get("action","").startswith("rejected") for e in trace),
              "fof_cross_component_proposals":sum("candidate" in e and component_id.get(e.get("client"))!=component_id.get(e.get("candidate")) for e in trace),"fof_component_count":len(set(component_id.values()))}
