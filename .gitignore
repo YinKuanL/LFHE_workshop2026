@@ -30,6 +30,9 @@ slurm-*.out
 # Generated plots
 *.png
 *.pdf
+*.svg
+!figures/
+!figures/**
 
 # Temporary files
 *.tmp

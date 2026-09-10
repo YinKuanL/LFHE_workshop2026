@@ -1,3 +1,4 @@
+import inspect
 import random
 import numpy as np
 import torch
@@ -9,6 +10,8 @@ def canonical_args(extra=""):
 def test_canonical_defaults():
     c=main.make_config(canonical_args()); assert (c.alpha,c.rounds,c.local_epochs,c.batch_size,c.lr,c.topology_interval,c.eval_interval,c.dmax,c.w1,c.w2,c.w3)==(.1,300,1,32,.05,5,5,4,1.,1.,.1)
     model=main.CNN(); assert list(model.classifier[-1].weight.shape)==[10,256] and model.get_representation().numel()==2560
+    state=main.initial_states(1,42)[0]
+    assert main.topology_representation(state,"flatten").numel()==2570
 def test_paired_initial_graph_and_models():
     a=main.make_config(canonical_args()); b=main.make_config(main.parser().parse_args("--method static_random --num-clients 30 --seed 42 --protocol canonical --output-dir unused".split()))
     assert set(main.initial_graph(a).edges())==set(main.initial_graph(b).edges())
@@ -51,3 +54,10 @@ def test_snapshot_concurrent_preserves_degree_cap():
     states=main.initial_states(20,42); graph=main.bounded_connected(20,4,42); clients=[main.Adapter(s) for s in states]
     updated,trace,stats=main.snapshot_concurrent_lfhe(graph,clients,range(20),cfg,0)
     assert max(dict(updated.degree()).values())<=4 and 0<=stats["shared_endpoint_conflict_rate"]<=1
+
+def test_morph_round_zero_logging_initializes_representation_view_round():
+    source=inspect.getsource(main.run)
+    assert "        view_round=None" in source
+    assert '        if cfg.method!="morph"' in source
+    assert '"representation_view_round":view_round' in source
+    assert 'view_round if rnd%cfg.topology_interval' not in source

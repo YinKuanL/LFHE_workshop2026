@@ -30,7 +30,7 @@ Optional maximum: **76 runs**. Grand maximum: **320 runs**.
 
 ## Promotion and stopping thresholds
 
-- Canonical: no downstream array until all 25 outputs pass `validate_stage.py`; classifier weight shape must be `[10,256]`, flattened dimension 2560, and each method's final accuracy must lie inside `historical_canonical_ranges.json`.
+- Canonical: no downstream array until all 25 outputs pass `validate_stage.py`; classifier weight shape must be `[10,256]`. The updated workshop `lfhe` method uses the MD-LFHE classifier-head representation (weight plus bias, dimension 2570); other representation contracts remain method-specific. Each method's final accuracy must lie inside `historical_canonical_ranges.json`.
 - Projected 300-round runtime: at most 48 hours.
 - Peak CPU RSS: at most 22.4 GiB under the 28 GiB request.
 - Peak GPU reserved memory: at most 90% of allocated device memory.
