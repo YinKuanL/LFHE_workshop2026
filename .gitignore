@@ -11,6 +11,12 @@ datasets/
 # Experiment outputs
 outputs/
 results/
+!results/
+results/*
+!results/tables/
+!results/tables/**
+!results/figures/
+!results/figures/**
 checkpoints/
 scalability_checkpoints/
 logs/
@@ -33,6 +39,8 @@ slurm-*.out
 *.svg
 !figures/
 !figures/**
+!results/figures/
+!results/figures/**
 
 # Temporary files
 *.tmp

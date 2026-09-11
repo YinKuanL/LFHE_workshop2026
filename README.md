@@ -2,51 +2,59 @@
 
 This repository studies when bounded local topology evolution remains effective as decentralized learning systems scale.
 
-![LFHE topology evolution overview](figures/lfhe_topology_evolution_overview.png)
-
-## Research Question
-
-When does bounded local topology evolution remain effective as decentralized systems scale?
-
 ## Method Overview
 
 LFHE uses local friends-of-friends discovery and bounded topology transactions to evolve a communication graph without a central optimizer. The workshop suite evaluates how this mechanism behaves as client count, data regime, degree budget, graph mixing, participation, and link reliability change.
 
-![Morph and LFHE topology update comparison](figures/lfhe_morph_comparison.png)
+![LFHE topology evolution overview](results/figures/lfhe_topology_evolution_overview.png)
 
-## Key Dimensions
+![Morph and LFHE topology update comparison](results/figures/lfhe_morph_comparison.png)
 
-| Dimension | Repository evidence |
+## Key Results
+
+The repository now tracks compact CSV summaries aggregated from complete frozen `summary.json` outputs in the local workshop snapshot. These are public, lightweight summaries only; raw datasets, checkpoints, logs, and bulk generated outputs remain untracked.
+
+| Table | Scope |
 |---|---|
-| Client population | N=10 alignment runs and N=50/100/200/500 scaling manifests |
-| Data regime | Fixed-total and fixed-per-client manifest families |
-| Degree budget | Fixed-degree and increasing-degree configurations |
-| Graph mixing | Ring, Static Random, Epidemic, DissDL, Morph, LFHE, Random-FoF, and LFHE-PAC variants |
-| Communication cost | Degree, participation, link-failure, stale-view, and candidate-reach settings encoded in manifests |
-| Transaction behavior | Checkpoint/resume logic, shared initial topology hashes, topology delta logs, and validation tests |
+| [results/tables/scaling_fixed_total.csv](results/tables/scaling_fixed_total.csv) | Fixed-total N={50,100,200,500} complete summaries where available |
+| [results/tables/scaling_fixed_per_client.csv](results/tables/scaling_fixed_per_client.csv) | Fixed-samples-per-client summaries for verified completed runs |
+| [results/tables/degree_scaling.csv](results/tables/degree_scaling.csv) | Static-random degree-sweep controls found in the frozen snapshot |
+| [results/tables/graph_diagnostics.csv](results/tables/graph_diagnostics.csv) | Final graph degree, clustering, spectral-gap, and LFHE transaction diagnostics |
+| [results/tables/large_n_controls.csv](results/tables/large_n_controls.csv) | Large-N static-random control summaries found in the frozen snapshot |
 
-## Results Status
+## Main Result Table
 
-The checked-in repository preserves experiment code, manifests, validation tests, and cluster infrastructure. It does **not** currently track finalized numeric scaling-result tables or bulk generated outputs.
+Selected fixed-total summaries from `scaling_fixed_total.csv`:
 
-Verified claims from tracked provenance:
+| Method | N | Degree budget | Completed seeds | Final accuracy mean | Normalized AUC mean |
+|---|---:|---:|---|---:|---:|
+| DissDL | 50 | 4 | 42;43;44;45;46 | 0.740376 | 0.638655 |
+| Epidemic | 50 | 4 | 42;43;44;45;46 | 0.754318 | 0.649799 |
+| Static Random | 50 | 4 | 46 | 0.720476 | 0.616024 |
+| DissDL | 100 | 4 | 42;43;44;45;46 | 0.691472 | 0.572236 |
+| Epidemic | 100 | 4 | 42;43;44;45;46 | 0.696443 | 0.578910 |
+| LFHE | 100 | 4 | 42;43;44;45 | 0.675151 | 0.557260 |
+| Morph | 100 | 4 | 42;43;44;45;46 | 0.705163 | 0.594443 |
+| Random-FoF | 100 | 4 | 42;43;44;45;46 | 0.646677 | 0.538270 |
+| Static Random | 100 | 4 | 42;43;44;45;46 | 0.671432 | 0.555069 |
 
-- `manifests/mira_core.csv` contains 194 experiment rows.
-- `manifests/mira_all.csv` contains 413 experiment rows and reuses the Core output directories for its first 194 rows.
-- `manifests/workshop_main_shared_static_init_n50_500.csv` contains the 120-run N={50,100,200,500}, seeds 42-46 shared-initial-topology comparison.
-- `EXPERIMENT_PLAN.md` defines staged promotion gates, stopping thresholds, and optional feasibility/scaling studies.
-- `tests/` and `validate_stage.py` check manifest consistency, topology invariants, validation contracts, and checkpoint/resume behavior.
+Seed coverage is explicit because the frozen snapshot contains partial coverage for some methods. Use the CSV files, not this excerpt, as the complete tracked summary.
 
-Do not extract TODO tables from draft manuscripts as results. Add final README result tables only after the frozen output summaries or final submission figures are available as provenance.
+## Main Figures
 
-## Current Figures
+The tracked figures are method/design figures:
 
-The current README uses method/experiment-design figures only:
+- [results/figures/lfhe_topology_evolution_overview.png](results/figures/lfhe_topology_evolution_overview.png)
+- [results/figures/lfhe_morph_comparison.png](results/figures/lfhe_morph_comparison.png)
 
-- `figures/lfhe_topology_evolution_overview.png`, copied from `images/overview.png`.
-- `figures/lfhe_morph_comparison.png`, copied from `images/morph_lfhe.png`.
+No generated scaling plot is promoted unless its source and finalized status can be verified. The current numerical evidence is published as CSV tables instead.
 
-No manuscript PDF screenshots are used, and no generated result plot is promoted as final scaling evidence in this staging branch.
+## Key Findings
+
+- The fixed-total snapshot contains complete five-seed summaries for DissDL, Epidemic, and Static Random at N=100/200/500, plus complete or partial coverage for LFHE, Morph, and Random-FoF at N=100.
+- The fixed-per-client snapshot contains verified completed Static Random and Random-FoF controls for N=100/200/500, but not a complete LFHE fixed-per-client headline suite.
+- The degree-sweep table currently represents verified Static Random controls, not a full LFHE degree-ablation claim.
+- Graph diagnostics expose final graph structure and LFHE transaction counters where those fields are present in the frozen summaries.
 
 ## Reproduction
 
@@ -73,27 +81,6 @@ sbatch slurm/run_all_mira.sbatch
 
 Core and All must not run concurrently because they intentionally share output directories for the Core subset.
 
-## Shared Static-Random Initial Topology Suite
-
-`manifests/workshop_main_shared_static_init_n50_500.csv` is the 120-run N={50,100,200,500}, seeds 42-46 main comparison. Every row enables `--shared-initial-topology`; the common undirected graph is `bounded_connected(N,Dmax,seed)`, the same graph used by Static Random. Runs record `graph_initial_common.edgelist` and `initial_common_topology_hash`.
-
-```bash
-sbatch --array=0-119%4 slurm/run_shared_initial_main_ncc.sbatch
-```
-
-## Topology Evolution Diagnostics
-
-PAC runs record an initial edge list and per-update edge deltas. Build a self-contained viewer from generated outputs:
-
-```bash
-python scripts/build_topology_animation.py \
-  --outputs outputs/workshop_main_remaining_md_aligned_n50_500 \
-  --methods random_fof lfhe \
-  --output reports/topology_evolution.html
-```
-
-The builder is read-only with respect to experiment outputs and tolerates a partially appended final JSONL line.
-
 ## Repository Structure
 
 - `main.py`: official experiment runner.
@@ -104,9 +91,10 @@ The builder is read-only with respect to experiment outputs and tolerates a part
 - `scripts/`: manifest generation, validation, summarization, and topology-animation utilities.
 - `tests/`: regression tests for manifests, validation contracts, and topology utilities.
 - `legacy/`: superseded runners and submission scripts retained for historical reference only.
-- `figures/`: curated README figures.
+- `results/tables/`: curated lightweight result summaries.
+- `results/figures/`: curated README method/design figures.
 
-## Provenance
+## Result Provenance
 
 See [docs/results_provenance.md](docs/results_provenance.md). Generated datasets, checkpoints, result arrays, logs, plots, scheduler outputs, and local archives are intentionally excluded from Git.
 
