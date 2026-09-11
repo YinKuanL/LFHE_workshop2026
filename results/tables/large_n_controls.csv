@@ -1,0 +1,2 @@
+"suite","data_regime","method","n","dmax","completed_seeds","completion_count","final_accuracy_mean","normalized_auc_mean","rounds_completed_mean","model_bytes_mean","control_bytes_mean","candidate_packets_mean","committed_transactions_mean","final_edges_mean","final_mean_degree_mean","final_clustering_mean","final_spectral_gap_mean"
+"workshop_large_scale","fixed_total_large_n_control","static_random","1000","4","42;43;44","3","0.424633","0.338029","300.000000","","","","","1500.000000","3.000000","0.001250","0.052009"

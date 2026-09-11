@@ -1,45 +1,62 @@
 # LFHE Workshop 2026 Scaling Experiments
 
-This repository contains the LFHE workshop experiment suite for studying how local topology evolution scales in fully decentralized learning.
+This repository studies when bounded local topology evolution remains effective as decentralized learning systems scale.
 
-## Research question
+## Method Overview
 
-Fully decentralized learning systems must decide which peers exchange model updates without relying on a server or global graph optimizer. The central question in this repository is whether local, bounded-degree topology evolution can preserve learning quality and graph safety as the number of clients increases.
+LFHE uses local friends-of-friends discovery and bounded topology transactions to evolve a communication graph without a central optimizer. The workshop suite evaluates how this mechanism behaves as client count, data regime, degree budget, graph mixing, participation, and link reliability change.
 
-## Core method
+![LFHE topology evolution overview](results/figures/lfhe_topology_evolution_overview.png)
 
-The official experiment entry point is `main.py`. It runs the canonical LFHE protocol and scalable workshop variants, including the real Morph implementation through `MorphNode` from `morph.py`. Do not substitute Random-FoF or another topology method for Morph.
+![Morph and LFHE topology update comparison](results/figures/lfhe_morph_comparison.png)
 
-LFHE evaluates local friends-of-friends candidates, proposes topology swaps when they improve local novelty, and coordinates endpoint updates so the graph evolves while respecting degree and connectivity constraints.
+## Key Results
 
-![LFHE local topology evolution overview](figures/lfhe_topology_evolution_overview.png)
+The repository now tracks compact CSV summaries aggregated from complete frozen `summary.json` outputs in the local workshop snapshot. These are public, lightweight summaries only; raw datasets, checkpoints, logs, and bulk generated outputs remain untracked.
 
-## Experiment regimes
+| Table | Scope |
+|---|---|
+| [results/tables/scaling_fixed_total.csv](results/tables/scaling_fixed_total.csv) | Fixed-total N={50,100,200,500} complete summaries where available |
+| [results/tables/scaling_fixed_per_client.csv](results/tables/scaling_fixed_per_client.csv) | Fixed-samples-per-client summaries for verified completed runs |
+| [results/tables/degree_scaling.csv](results/tables/degree_scaling.csv) | Static-random degree-sweep controls found in the frozen snapshot |
+| [results/tables/graph_diagnostics.csv](results/tables/graph_diagnostics.csv) | Final graph degree, clustering, spectral-gap, and LFHE transaction diagnostics |
+| [results/tables/large_n_controls.csv](results/tables/large_n_controls.csv) | Large-N static-random control summaries found in the frozen snapshot |
 
-The tracked manifests cover the main workshop scaling regimes and validation studies:
+## Main Result Table
 
-| Regime | Tracked manifest or script | Scope |
-|---|---|---|
-| Core Mira suite | `manifests/mira_core.csv` | 194 rows |
-| All Mira suite | `manifests/mira_all.csv` | 413 rows; first 194 rows reuse Core output directories |
-| Shared Static-Random initial topology | `manifests/workshop_main_shared_static_init_n50_500.csv` | 120-run N={50,100,200,500}, seeds 42-46 comparison |
-| Approval-gated staged workflow | `EXPERIMENT_PLAN.md`, `manifests/stage*.csv`, `validate_stage.py` | Canonical alignment, feasibility, fixed-degree scaling, and secondary stress studies |
-| Topology evolution diagnostics | `scripts/build_topology_animation.py` | Builds an HTML viewer from recorded edge-list and delta logs |
+Selected fixed-total summaries from `scaling_fixed_total.csv`:
 
-Generated datasets, checkpoints, result arrays, logs, plots, and scheduler outputs are intentionally not stored in Git. The repository preserves the code, manifests, validation scripts, and operational infrastructure needed to regenerate them.
+| Method | N | Degree budget | Completed seeds | Final accuracy mean | Normalized AUC mean |
+|---|---:|---:|---|---:|---:|
+| DissDL | 50 | 4 | 42;43;44;45;46 | 0.740376 | 0.638655 |
+| Epidemic | 50 | 4 | 42;43;44;45;46 | 0.754318 | 0.649799 |
+| Static Random | 50 | 4 | 46 | 0.720476 | 0.616024 |
+| DissDL | 100 | 4 | 42;43;44;45;46 | 0.691472 | 0.572236 |
+| Epidemic | 100 | 4 | 42;43;44;45;46 | 0.696443 | 0.578910 |
+| LFHE | 100 | 4 | 42;43;44;45 | 0.675151 | 0.557260 |
+| Morph | 100 | 4 | 42;43;44;45;46 | 0.705163 | 0.594443 |
+| Random-FoF | 100 | 4 | 42;43;44;45;46 | 0.646677 | 0.538270 |
+| Static Random | 100 | 4 | 42;43;44;45;46 | 0.671432 | 0.555069 |
 
-## Key findings supported by tracked provenance
+Seed coverage is explicit because the frozen snapshot contains partial coverage for some methods. Use the CSV files, not this excerpt, as the complete tracked summary.
 
-The repository records the experiment design and reproducibility infrastructure rather than storing bulk generated results. The checked-in provenance supports the following claims:
+## Main Figures
 
-- The Core Mira suite contains 194 manifest rows, and the All Mira suite contains 413 rows.
-- The shared-initial-topology main suite contains 120 rows for N={50,100,200,500} and seeds 42-46.
-- `EXPERIMENT_PLAN.md` defines the staged promotion gates, validation thresholds, and optional feasibility studies used to separate submission-critical scaling evidence from exploratory extensions.
-- `validate_stage.py` and the test suite check manifest consistency, topology invariants, checkpoint/resume behavior, and validation contracts.
+The tracked figures are method/design figures:
 
-Do not report numeric accuracy, runtime, communication, or memory results from this repository unless they are regenerated from the manifests or verified from separately archived experiment outputs.
+- [results/figures/lfhe_topology_evolution_overview.png](results/figures/lfhe_topology_evolution_overview.png)
+- [results/figures/lfhe_morph_comparison.png](results/figures/lfhe_morph_comparison.png)
 
-## Quick start
+No generated scaling plot is promoted unless its source and finalized status can be verified. The current numerical evidence is published as CSV tables instead.
+
+## Key Findings
+
+- The fixed-total snapshot contains complete five-seed summaries for DissDL, Epidemic, and Static Random at N=100/200/500, plus complete or partial coverage for LFHE, Morph, and Random-FoF at N=100.
+- The fixed-per-client snapshot contains verified completed Static Random and Random-FoF controls for N=100/200/500, but not a complete LFHE fixed-per-client headline suite.
+- The degree-sweep table currently represents verified Static Random controls, not a full LFHE degree-ablation claim.
+- Graph diagnostics expose final graph structure and LFHE transaction counters where those fields are present in the frozen summaries.
+
+## Reproduction
 
 Use a Python environment with PyTorch, torchvision, NumPy, NetworkX, SciPy, psutil, and pytest. Stage CIFAR-10 before compute-node execution if compute nodes have no internet access. Set `LFHE_DATA_ROOT` to the staged dataset directory when needed.
 
@@ -47,8 +64,6 @@ Use a Python environment with PyTorch, torchvision, NumPy, NetworkX, SciPy, psut
 python -m py_compile main.py lfhe.py morph.py dissdl.py epidemic.py run_manifest_row.py generate_mira_manifest.py validate_stage.py
 python -m pytest -q
 ```
-
-## Reproducing reported experiments
 
 Generate the checked-in Core and All manifests reproducibly:
 
@@ -64,73 +79,25 @@ sbatch slurm/run_core_mira.sbatch
 sbatch slurm/run_all_mira.sbatch
 ```
 
-Core contains 194 runs. All contains 413 runs and deliberately reuses the same output directories for its Core subset. Do not run Core and All concurrently, because two tasks must never write to the same output directory.
+Core and All must not run concurrently because they intentionally share output directories for the Core subset.
 
-Each array task passes its zero-based `SLURM_ARRAY_TASK_ID` to `run_manifest_row.py`. `csv.DictReader` removes the header, so Core indices `0-193` select all 194 data rows and All indices `0-412` select all 413 data rows without skipping the first experiment or reading the header.
-
-## Shared Static-Random initial topology suite
-
-`manifests/workshop_main_shared_static_init_n50_500.csv` is the clean 120-run N={50,100,200,500}, seeds 42-46 main comparison. Every row enables `--shared-initial-topology`: the common undirected graph is exactly `bounded_connected(N,Dmax,seed)`, the same graph used by Static Random. Directed methods store the same neighbor set as bidirectional sender links, and PAC methods wrap the exact edge set in their protected-tree transaction state. Each run records `graph_initial_common.edgelist` and `initial_common_topology_hash`.
-
-Submit at most four concurrent NCC jobs from the checkout root:
-
-```bash
-sbatch --array=0-119%4 slurm/run_shared_initial_main_ncc.sbatch
-```
-
-## Interactive topology evolution
-
-PAC runs record an initial edge list and per-update edge deltas. Build a self-contained viewer that can select method, client count, and seed, then play or scrub the exact topology evolution:
-
-```bash
-python scripts/build_topology_animation.py \
-  --outputs outputs/workshop_main_remaining_md_aligned_n50_500 \
-  --methods random_fof lfhe \
-  --output reports/topology_evolution.html
-```
-
-The builder is read-only with respect to experiment outputs and tolerates a partially appended final JSONL line, so it can also be run while jobs execute.
-
-## Repository structure
+## Repository Structure
 
 - `main.py`: official experiment runner.
-- `morph.py`, `lfhe.py`, `dissdl.py`, `epidemic.py`: topology implementations and baselines.
-- `generate_mira_manifest.py`: deterministic Core/All manifest generator.
-- `run_manifest_row.py`: executes one zero-based CSV data row.
+- `morph.py`, `lfhe.py`, `dissdl.py`, `epidemic.py`, `lfhe_pac.py`: topology implementations and baselines.
+- `generate_mira_manifest.py`, `run_manifest_row.py`: deterministic manifest generation and row execution.
 - `manifests/`: Core, All, workshop, and staged experiment manifests.
 - `slurm/`: Mira/NCC submission scripts and manifest workers.
 - `scripts/`: manifest generation, validation, summarization, and topology-animation utilities.
-- `tests/`: lightweight regression tests for manifests, validation contracts, and topology utilities.
+- `tests/`: regression tests for manifests, validation contracts, and topology utilities.
 - `legacy/`: superseded runners and submission scripts retained for historical reference only.
-- `figures/`: small curated figures for public documentation.
+- `results/tables/`: curated lightweight result summaries.
+- `results/figures/`: curated README method/design figures.
 
-## Completion and resume
+## Result Provenance
 
-- `SUCCESS` means the run completed.
-- `checkpoint.pt` without `SUCCESS` means the run is incomplete and can resume.
-- Existing `SUCCESS` directories are skipped.
-- Existing incomplete checkpoint directories receive `--resume`.
-- Never allow two jobs to write to one output directory.
+See [docs/results_provenance.md](docs/results_provenance.md). Generated datasets, checkpoints, result arrays, logs, plots, scheduler outputs, and local archives are intentionally excluded from Git.
 
-Dataset, outputs, results, logs, checkpoints, caches, job IDs, model artifacts, result arrays, and local archives are excluded from Git. Keep these on project or scratch storage, not in commits.
+## Citation and License
 
-## Validation
-
-Before submission or publication, run:
-
-```bash
-python -m py_compile main.py lfhe.py morph.py dissdl.py epidemic.py run_manifest_row.py generate_mira_manifest.py validate_stage.py
-python -m pytest -q
-bash -n slurm/run_core_mira.sbatch
-bash -n slurm/run_all_mira.sbatch
-```
-
-The older stage manifests and SLURM scripts remain in place because `validate_stage.py`, tests, and `EXPERIMENT_PLAN.md` still use that staged workflow. They are reproducibility assets, not alternative official entry points.
-
-## Provenance
-
-`EXPERIMENT_PLAN.md` records approval gates, stopping thresholds, and optional study boundaries. `README_LFHE_MIRA.md` provides a compact cluster-run reference. The checked-in manifests are the source of truth for intended experiment rows; generated outputs should be archived outside Git with their manifest row, command line, seed, environment, and completion marker.
-
-## Citation and license
-
-No author-identifying citation or publication-status statement is included here while the work may need to remain anonymous for review. Add citation and license information only when doing so is compatible with the submission policy for the repository.
+No author-identifying citation or publication-status statement is included here while review constraints are uncertain. Add citation and license information only when compatible with the submission policy for this repository.
